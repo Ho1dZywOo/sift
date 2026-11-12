@@ -58,7 +58,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from sift.audit.aggregate import aggregate_by_instruction, aggregate_coverage
-from sift.audit.text_coverage import build_text_coverage
 from sift.audit.boundary import aggregate_boundary
 from sift.audit.control_flow import (
     OrderPair,
@@ -115,6 +114,7 @@ from sift.audit.noise import annotate_aggregate_noise, annotate_noise
 from sift.audit.preparation import apply_headlines_cached, refine_instructions_cached
 from sift.audit.provenance import analyze_provenance, has_provenance_evidence
 from sift.audit.rebuild import rebuild
+from sift.audit.text_coverage import build_text_coverage
 from sift.audit.tool_match import (
     count_tool_calls,
     extract_first_balanced,
