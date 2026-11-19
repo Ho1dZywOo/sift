@@ -470,6 +470,9 @@ def judge_batch_with_retry(
     last_cause = "unknown"
     best: list | None = None  # 漏答过半重试期间覆盖最高的一份(耗尽时回它,不弃批)
     best_ok = 0
+    # 决策链单点:批次级 resolve 一次、批内全部 attempt 复用(转接决策与可见告警不再
+    # 每次重试重复发生;resolve 本身每次现查不缓存,见 _transport_fallback_for)。
+    transport = resolve_llm_transport(options.transport, default=options.transport_default)
     for attempt in range(_LLM_RETRY_MAX + 1):
         if attempt > 0:
             time.sleep(_LLM_RETRY_DELAY * attempt)
@@ -479,7 +482,7 @@ def judge_batch_with_retry(
         try:
             # 限制器门控全局在飞 call_claude ≤ 当前 ceiling(AIMD 动态调):跨类别 + 同类多批
             # 统一争这一个。只圈住 call_claude(不圈 parse/重试 sleep),故重试退避不占槽。
-            result_text = _call_judge_model(batch, options)
+            result_text = _call_judge_model(batch, options, transport)
         except HttpRateLimited as exc:
             # 429(账户速率/并发限制):AIMD 乘性减并发 + 指数退避后重试(同账号同限,cc 也撞、
             # 不回退)。速率限制按分钟窗口计,固定短退避会在窗口内反复撞死(glm-5.3 实测 8 并发
@@ -524,7 +527,7 @@ def judge_batch_with_retry(
     return _finish_judge_retries((best, best_ok), batch, options, prefix, last_cause)
 
 
-def _call_judge_model(batch, options):
+def _call_judge_model(batch, options, transport: str):
     with LLM_LIMITER:
         result_text = call_claude(
             prompt=batch.prompt,
@@ -535,11 +538,11 @@ def _call_judge_model(batch, options):
                 timeout=options.timeout,
                 max_turns=1,
                 schema=options.schema,
-                # 决策链单点:显式 > SIFT_LLM_TRANSPORT > site default(主判官批 cc、
-                # http 优选批经 transport_default=http —— env 一键全局换判官引擎)。
-                transport=resolve_llm_transport(
-                    options.transport, default=options.transport_default
-                ),
+                # transport 已由 judge_batch_with_retry 在重试循环外 resolve 一次
+                # (显式 > SIFT_LLM_TRANSPORT > site default;主判官批 cc、http 优选批
+                # 经 transport_default=http —— env 一键全局换判官引擎),批内重试复用
+                # 同一裁决,不再每次 attempt 重 resolve / 重打转接告警。
+                transport=transport,
             ),
         )
     return result_text

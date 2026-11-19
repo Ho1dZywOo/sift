@@ -163,6 +163,17 @@ def test_resolve_falls_back_to_opencode_when_claude_missing(monkeypatch, caplog)
     assert "SIFT_LLM_TRANSPORT=opencode" in caplog.text  # 提示里带「怎么固定」
 
 
+def test_resolve_fallback_announced_once_across_repeated_calls(monkeypatch, caplog):
+    """同一转接(cc→opencode)进程内只播报一次:判官批多批 × 重试反复 resolve 不刷屏。"""
+    monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    _pin_which(monkeypatch, {"opencode"})
+    with caplog.at_level(logging.WARNING):
+        for _ in range(10):
+            assert transport.resolve_llm_transport(None) == "opencode"
+            assert transport.resolve_llm_transport("cc") == "opencode"
+    assert caplog.text.count("claude CLI 未找到") == 1  # 十次 resolve 只一条告警
+
+
 def test_resolve_keeps_cc_when_fallback_target_also_missing(monkeypatch):
     """cc 缺 + 兜底目标也缺 → 维持 cc(如实,不 mask);由 call_cli 前置检查报清楚。"""
     monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)

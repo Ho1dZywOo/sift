@@ -118,6 +118,9 @@ def _parse_stream(stdout: str) -> tuple[str, dict, float, str, str]:
     - ``tokens``:取**末个** ``step_finish``(单步 agent 一步;多步时步间 input
       含缓存重复计入,求和会虚高 —— 末步最接近会话总量,与 ``OpenCodeRunner``
       同一取舍)。
+    - ``cost``:逐 ``step_finish`` **累加**。与 ``tokens`` 取末步**有意不对称**——
+      token 计数跨 step 求和会重复计入步间缓存的 input(虚高),而每个 step 是独立
+      计费单元、cost 只有累加才是全程真实花费,二者各按自己的正确口径取。
     - ``error``:顶层 ``error`` 事件(非 ``part``)—— provider/传输失败。
     """
     parts: dict[str, str] = {}

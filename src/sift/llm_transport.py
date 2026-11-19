@@ -207,8 +207,21 @@ def _transport_fallback_for(transport: str) -> str:
     return transport
 
 
+# 已播报过的转接:转接决策是确定性环境事实(CLI 缺位),同一条转接进程内只报一次 ——
+# resolve 会在判官多批 × 重试里被反复调用,重复告警是纯刷屏(一场几十批的 audit 会打出
+# 几十条一模一样的「cc 已转 opencode」)。报一次仍满足「兜底必可见」,刷屏反把真问题淹没。
+_announced_transport_fallbacks: set[tuple[str, str]] = set()
+
+
 def _announce_transport_fallback(from_transport: str, to_transport: str) -> None:
-    """兜底必可见:转接打一行 warning(logging 无 handler 时 lastResort 落 stderr,CLI 直达)。"""
+    """兜底必可见:转接打一行 warning(logging 无 handler 时 lastResort 落 stderr,CLI 直达)。
+
+    同一条转接全程只播报一次(``_announced_transport_fallbacks`` 去重),避免多批重试刷屏。
+    """
+    key = (from_transport, to_transport)
+    if key in _announced_transport_fallbacks:
+        return
+    _announced_transport_fallbacks.add(key)
     logging.warning(
         "%s CLI 未找到,LLM 调用已转 %s transport(静态缺位兜底);要固定该引擎可显式设 SIFT_LLM_TRANSPORT=%s",
         _TRANSPORT_CLI_NAMES[from_transport],

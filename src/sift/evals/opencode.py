@@ -104,9 +104,11 @@ def _normalize_opencode_v2_message(m: dict) -> dict | None:
     typ = m.get("type")
     if typ == "user":
         text = m.get("text") or ""
-        # opencode 2.x 实测怪癖:user text 被双重 JSON 编码(值首尾带 ")。audit 靠
-        # user_turns 匹配任务指令,多一层引号会全数失配 → 剥一层 JSON 字符串包装;
-        # 条件保守(引号起止 + 可解析为 str),裸文本不受影响。
+        # opencode 2.x 实测怪癖:user text 被双重 JSON 编码 —— 字段值是 ``json.dumps``
+        # 后的原文(整个值就是一个 JSON 字符串字面量,首尾带 ")。audit 靠 user_turns
+        # 匹配任务指令,多一层引号会全数失配 → 用 json.loads 剥回原文。原文本身首尾
+        # 带引号时,其引号在编码里会被转义(如原文 '"x"' → 字段 '"\"x\""'),json.loads
+        # 恰好还原、不会误剥;非 JSON 字符串的裸文本 json.loads 抛错 → 原样保留。
         if text.startswith('"') and text.endswith('"') and len(text) >= 2:
             try:
                 decoded = json.loads(text)

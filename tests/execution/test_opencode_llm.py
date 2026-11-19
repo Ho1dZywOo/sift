@@ -83,6 +83,39 @@ def test_parse_stream_step_finish_tokens_and_cost():
     assert reason == "stop"
 
 
+def test_parse_stream_multi_step_tokens_last_cost_accumulated():
+    """多步:tokens 取末个 step_finish(防步间缓存的 input 重复计入),cost 逐 step 累加(真实计费)。"""
+    stdout = "\n".join(
+        [
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {
+                        "reason": "tool-calls",
+                        "cost": 0.01,
+                        "tokens": {"input": 100, "output": 10, "reasoning": 80, "cache": {"read": 50, "write": 0}},
+                    },
+                }
+            ),
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {
+                        "reason": "stop",
+                        "cost": 0.03,
+                        "tokens": {"input": 210, "output": 26, "reasoning": 30, "cache": {"read": 120, "write": 0}},
+                    },
+                }
+            ),
+        ]
+    )
+    _, tokens, cost, reason, _ = oll._parse_stream(stdout)
+    # tokens 取末步(不随步数累加),cost 累加全程
+    assert tokens["input"] == 210 and tokens["output"] == 26
+    assert cost == 0.04
+    assert reason == "stop"
+
+
 def test_parse_stream_error_event_and_noise_lines():
     stdout = "\n".join(
         [

@@ -673,6 +673,17 @@ def test_build_digest_from_v2_export(tmp_path):
     assert "E-FAKE-999" in d.transcript_text
 
 
+def test_load_v2_quoted_user_text_preserved(tmp_path):
+    """原文首尾带引号(任务指令本身是引号串)时,剥一层双重编码后引号保留、不误剥。"""
+    sess = _v2_export()
+    raw = '"verify the fix"'  # 任务指令原文本身首尾带引号
+    sess["messages"][0]["text"] = json.dumps(raw)  # opencode 2.x 双重编码(json.dumps 后的原文)
+    p = tmp_path / "quoted-session.json"
+    p.write_text(json.dumps(sess, ensure_ascii=False), encoding="utf-8")
+    loaded = load_opencode_session(p)
+    assert loaded["messages"][0]["parts"][0]["text"] == '"verify the fix"'  # 引号保留
+
+
 def test_load_v1_shape_passthrough_untouched():
     """1.x 形状原样透传(幂等):既有 fixture 不经垫片改动。"""
     sess = load_opencode_session(_LEA_OC)
