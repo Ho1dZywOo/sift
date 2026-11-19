@@ -16,7 +16,7 @@ import random
 import threading
 import time
 
-from sift.llm_transport import HttpRateLimited, LLMCallConfig
+from sift.llm_transport import HttpRateLimited, LLMCallConfig, resolve_llm_transport
 from sift.utils import call_claude
 
 
@@ -224,7 +224,7 @@ def call_llm_with_retry(
     timeout: int = 120,
     schema: dict | None = None,
     on_usage=None,
-    transport: str = "http",
+    transport: str | None = None,
     on_progress=None,
     max_retries: int = _LLM_WRAPPER_RETRY_MAX,
     max_tokens: int | None = None,
@@ -237,9 +237,11 @@ def call_llm_with_retry(
 
     结构严格镜像 audit ``judge_batch_with_retry``:``with LLM_LIMITER:`` 只圈 ``call_claude``
     (重试退避不占槽);**成功赋值不早返**(早返会跳过 with 外的 ``on_success`` → AIMD 永不加性增
-    → 静默劣化),``on_success``/``on_throttled``/sleep 都在 with 外。默认 ``transport="http"``
-    (forced tool_use、schema-safe)。
+    → 静默劣化),``on_success``/``on_throttled``/sleep 都在 with 外。site default ``http``
+    (forced tool_use、schema-safe),``transport=None`` 时经 ``resolve_llm_transport`` 让
+    ``SIFT_LLM_TRANSPORT`` 全局覆盖(opencode/dsh 等)。
     """
+    resolved_transport = resolve_llm_transport(transport, default="http")
     for attempt in range(max_retries + 1):
         if attempt > 0:
             time.sleep(_LLM_WRAPPER_RETRY_DELAY * attempt)
@@ -251,7 +253,11 @@ def call_llm_with_retry(
                     on_usage=on_usage,
                     on_progress=on_progress,
                     config=LLMCallConfig(
-                        model=model, timeout=timeout, schema=schema, transport=transport, max_tokens=max_tokens
+                        model=model,
+                        timeout=timeout,
+                        schema=schema,
+                        transport=resolved_transport,
+                        max_tokens=max_tokens,
                     ),
                 )
         except HttpRateLimited as exc:

@@ -72,9 +72,10 @@ def patched_spawn(monkeypatch, tmp_path):
 
     def fake_run_opencode(xdg, args, timeout=120):
         cap["run_calls"].append(list(args))
-        if args[:2] == ["session", "list"]:
-            return json.dumps([{"id": "ses_abc", "title": "t"}])
-        if args[0] == "export":
+        # 2.x 全量 API 通道列 session(CLI session list 按 cwd 项目过滤,列不到隔离库)
+        if args[:3] == ["api", "--standalone", "GET"]:
+            return json.dumps({"data": [{"id": "ses_abc", "time": {"updated": 200}}], "cursor": {"next": None}})
+        if args[:2] == ["session", "export"]:
             return (
                 '{"info": {"tokens": {"input": 4993}}, "messages": [{"info": {"role": '
                 '"user"}, "parts": [{"type": "text", "text": "hi"}]}, {"info": {"role": '
@@ -85,7 +86,7 @@ def patched_spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(ocr.shutil, "which", fake_which)
     monkeypatch.setattr(ocr, "run_opencode", fake_run_opencode)
-    monkeypatch.setattr(ocr, "isolated_xdg_env_empty", lambda: _yield_ctx(tmp_path))
+    monkeypatch.setattr(ocr, "isolated_xdg_env_seeded", lambda: _yield_ctx(tmp_path))
     return cap
 
 
@@ -96,13 +97,15 @@ def test_run_builds_cmd_and_exports_raw(patched_spawn, tmp_path):
         options=ExecutionOptions(model="zai-anthropic/glm-5.2", cwd=tmp_path, timeout=30),
     )
     a = patched_spawn["popen_args"]
-    assert a[0:4] == ["opencode", "run", "--format", "json"]
+    # opencode 2.x:--standalone(私有 server,XDG 隔离前提)+ 无 --dir(已移除,目录走进程 cwd)
+    assert a[0:5] == ["opencode", "run", "--standalone", "--format", "json"]
     assert "--dangerously-skip-permissions" in a
-    assert "--dir" in a and str(tmp_path) in a
+    assert "--dir" not in a
+    assert patched_spawn["popen_kwargs"]["cwd"] == str(tmp_path)  # 目录经进程 cwd 控制
     assert "-m" in a and "zai-anthropic/glm-5.2" in a  # 含 / → 传
     assert a[-1] == "do it"  # prompt 末位
-    export_call = [c for c in patched_spawn["run_calls"] if c[0] == "export"][0]
-    assert export_call == ["export", "ses_abc"]
+    export_call = [c for c in patched_spawn["run_calls"] if c[:2] == ["session", "export"]][0]
+    assert export_call == ["session", "export", "--standalone", "ses_abc"]
     assert "--sanitize" not in export_call  # 原文,不脱敏
     assert json.loads(out.stdout)["messages"][1]["parts"][0]["text"] == "PONG"
     assert out.total_tokens == 7300
@@ -155,7 +158,7 @@ def test_run_timeout_kills_process_group_and_raises(monkeypatch, tmp_path):
     killed_gids = []
     monkeypatch.setattr(ocr.shutil, "which", lambda name: "/fake/opencode")
     monkeypatch.setattr(ocr, "run_opencode", lambda *a, **k: json.dumps([{"id": "ses_x"}]))
-    monkeypatch.setattr(ocr, "isolated_xdg_env_empty", lambda: _yield_ctx(tmp_path))
+    monkeypatch.setattr(ocr, "isolated_xdg_env_seeded", lambda: _yield_ctx(tmp_path))
     monkeypatch.setattr(ocr.os, "killpg", lambda gid, sig: killed_gids.append((gid, sig)))
     # start_new_session=True → 子进程是自己的组长,os.getpgid(child_pid) == child_pid;
     # 真实 getpgid 对假 pid 会抛 ProcessLookupError 被 runner 吞掉走 kill 分支,测不到 killpg,

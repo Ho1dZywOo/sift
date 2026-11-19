@@ -131,7 +131,7 @@ from sift.concurrency import (
 from sift.errors import SiftError
 from sift.evals.opencode import transcript_source
 from sift.execution.error_triage import classify_error
-from sift.llm_transport import HttpRateLimited, LLMCallConfig
+from sift.llm_transport import HttpRateLimited, LLMCallConfig, resolve_llm_transport
 from sift.models import (
     InstructionCheck,
     InstructionSource,
@@ -527,7 +527,11 @@ def _call_judge_model(batch, options):
                 timeout=options.timeout,
                 max_turns=1,
                 schema=options.schema,
-                transport=options.transport,
+                # 决策链单点:显式 > SIFT_LLM_TRANSPORT > site default(主判官批 cc、
+                # http 优选批经 transport_default=http —— env 一键全局换判官引擎)。
+                transport=resolve_llm_transport(
+                    options.transport, default=options.transport_default
+                ),
             ),
         )
     return result_text
@@ -767,7 +771,9 @@ class InstructionEngine:
                 on_usage=on_usage,
                 label="headline",
                 schema=_HEADLINE_SCHEMA,
-                transport="http",
+                # http 优选批(forced tool_use schema-safe):site default 经
+                # transport_default 表达,SIFT_LLM_TRANSPORT 仍可全局覆盖。
+                transport_default="http",
             ),
         )
         for start, parsed in successes:
@@ -1178,7 +1184,9 @@ class InstructionEngine:
                 on_usage=on_usage,
                 label="精筛",
                 schema=_CLASSIFY_REAL_SCHEMA,
-                transport="http",
+                # http 优选批(forced tool_use schema-safe):site default 经
+                # transport_default 表达,SIFT_LLM_TRANSPORT 仍可全局覆盖。
+                transport_default="http",
             ),
         )
         for start, parsed in successes:
@@ -2536,7 +2544,13 @@ def _run_instruction_batches(
         parse_fn=parse_fn,
         total=len(specs),
         is_unparsed=lambda value: value[0] is None,
-        options=options._replace(transport="http"),
+        options=options._replace(
+            # 主判官批漏斗(条件性/禁令/步骤/控制流):http 优选(forced tool_use
+            # schema-safe)。site default 经 transport_default 表达,SIFT_LLM_TRANSPORT
+            # 仍可全局覆盖(opencode/dsh 等)。
+            transport=None,
+            transport_default="http",
+        ),
     )
     for start, parsed in successes:
         for local_index, value in enumerate(parsed):

@@ -1,9 +1,12 @@
 """OpenCodeRunner — 路径1 真任务模式的 opencode 执行器(与 ClaudeRunner 对偶)。
 
 同签名 ``run(prompt, skill_path, model, timeout, cwd, max_turns, on_progress) -> RunOutput``。
-spawn ``opencode run <prompt> --format json --dangerously-skip-permissions --dir <cwd>
-[-m provider/model]``,在隔离 XDG_DATA_HOME 下跑(会话落一次性 db、不污染真库),
-跑完 export 刚建的 session(**不带 --sanitize**,audit 要原文)→ ``RunOutput.stdout``。
+spawn ``opencode run <prompt> --standalone --format json --dangerously-skip-permissions
+[-m provider/model]``,在隔离 XDG_DATA_HOME 下跑(会话落一次性 db、不污染真库;
+``--standalone`` 私有 server 是隔离在 opencode 2.x 生效的前提 —— 共享 service 持有
+操作员真实 env,客户端 XDG 被完全忽略),跑完 export 刚建的 session(**不带
+--sanitize**,audit 要原文)→ ``RunOutput.stdout``。目录经进程 cwd 控制(opencode 2.x
+已移除 ``--dir`` flag)。
 
 实战模式抄 opsbot src/opsbot/driver/opencode.py(spike-derived):
 - ``_ensure_api_key``:opencode @ai-sdk/anthropic 只读 ANTHROPIC_API_KEY,本机 GLM
@@ -27,7 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from sift.errors import ExecutionError
-from sift.evals.opencode_db import isolated_xdg_env_empty, run_opencode
+from sift.evals.opencode_db import isolated_xdg_env_seeded, run_opencode
 from sift.execution.cli_runner import build_live_prompt
 from sift.execution.options import ExecutionOptions
 from sift.models import RunOutput
@@ -122,11 +125,19 @@ class OpenCodeRunner:
         injected = build_live_prompt(prompt, skill_path)
         workspace = cwd or Path.cwd()
 
-        args = _opencode_run_command(injected, workspace, model)
+        args = _opencode_run_command(injected, model)
 
         start = time.time()
-        with isolated_xdg_env_empty() as xdg:
-            env = _ensure_api_key({**claude_cli_env(), "XDG_DATA_HOME": str(xdg)})
+        # 隔离 XDG seed 版:会话落一次性 db 不碰真库,同时 cp 真实 auth.json ——
+        # opencode 2.x 凭据存 XDG_DATA_HOME,隔离后不 seed 则凭据型 provider 全断。
+        with isolated_xdg_env_seeded() as xdg:
+            # PWD 必须重写为 workspace:opencode server 用 env 的 PWD(不是进程 cwd)做项目
+            # 发现 —— 残留 PWD 会把任务解析到 sift 自己的仓而非目标 workspace(opencode
+            # 2.x 移除 --dir 后,PWD+cwd 是目录控制的唯一通道;spike 实证)。
+            env = _ensure_api_key(
+                {**claude_cli_env(), "XDG_DATA_HOME": str(xdg), "PWD": str(workspace)}
+            )
+            env.pop("OLDPWD", None)
             try:
                 proc = subprocess.Popen(
                     args,
@@ -195,18 +206,27 @@ def _collect_opencode_output(proc, timeout: int, on_progress: Callable[[str], No
 
 
 def _export_opencode_session(xdg: Path, stderr: str) -> str:
-    """从本次隔离数据库导出原始会话，保留缺失会话时的诊断。"""
-    # export 刚跑的 session;不带 --sanitize(audit 要原文)
+    """从本次隔离数据库导出原始会话，保留缺失会话时的诊断。
+
+    opencode 2.x 形态:列 session 走 server API(``api --standalone GET /api/session``,
+    不按调用方 cwd 项目过滤 —— CLI ``session list`` 会过滤,session 的 directory=
+    workspace 与隔离 cwd 不匹配会列空),导出走 ``session export --standalone``
+    (顶层 ``export`` 子命令已删)。全部 ``--standalone``:否则连后台共享 service
+    读真库,隔离 db 读不到(service 持有操作员 env,客户端 XDG 被忽略;spike 实证)。
+    """
     try:
-        sessions = json.loads(run_opencode(xdg, ["session", "list", "--format", "json"]).strip() or "[]")
+        out = run_opencode(xdg, ["api", "--standalone", "GET", "/api/session"])
+        data = json.loads(out.strip() or "{}")
     except json.JSONDecodeError:
-        sessions = []
-    if not sessions:
+        data = {}
+    items = data.get("data") if isinstance(data, dict) else None
+    if not items:
         raise ExecutionError(f"opencode run 未持久化 session(无法 export;stderr: {stderr[:300]})")
-    # 隔离 XDG db 是 fresh 的,只含本次 opencode run 刚建的那条 session → sessions[0] 即它;
-    # 若 opencode 将来会额外建辅助 session,改按 timestamp 过滤而非盲取 [0]。
-    sid = sessions[0].get("id", "")
-    transcript_json = run_opencode(xdg, ["export", sid])  # 原文,不 sanitize
+    # 隔离 XDG db 是 fresh 的,只含本次 opencode run 刚建的那条 session → 按 updated
+    # desc 取最新即它;若 opencode 将来会额外建辅助 session,按 timestamp 过滤仍稳。
+    items.sort(key=lambda s: ((s.get("time") or {}).get("updated") or 0), reverse=True)
+    sid = items[0].get("id", "")
+    transcript_json = run_opencode(xdg, ["session", "export", "--standalone", sid])  # 原文,不 sanitize
 
     return transcript_json
 
@@ -233,16 +253,25 @@ def _read_opencode_stderr(proc, stderr_chunks: list[str]) -> None:
         stderr_chunks.append(raw.decode("utf-8", errors="replace"))
 
 
-def _opencode_run_command(injected: str, workspace: Path, model: str | None) -> list[str]:
-    """仅传入 opencode 支持的 provider/model 名称，保持参数排列。"""
+def _opencode_run_command(injected: str, model: str | None) -> list[str]:
+    """opencode 2.x 的 run 参数(2026-11-19 spike 实证适配,本机 2.0.24):
+
+    - **无 ``--dir`` flag**:2.x 已移除(传了直接 usage 报错 exit 1)——目录经进程
+      cwd(``Popen(cwd=workspace)``)控制,opencode 从 cwd 做项目发现。
+    - **``--standalone``(私有 server)**:2.x 默认连后台共享 service,service 持有
+      操作员真实 env → 客户端 ``XDG_DATA_HOME`` 被完全忽略、session 落真库、隔离目录
+      里连 db 都不出现(隔离 + export 机制整个失效,还会污染操作员会话库)。
+      standalone 每次私有 server + 客户端 env 生效 + session 落隔离一次性 db。
+    - ``--dangerously-skip-permissions`` 在 2.x 仍兼容(隐藏别名,实测 exit 0)。
+    - model 含 ``/`` 才传 ``-m``(裸名 opencode API 不认 → 跳过走 config 默认)。
+    """
     args = [
         "opencode",
         "run",
+        "--standalone",
         "--format",
         "json",
         "--dangerously-skip-permissions",
-        "--dir",
-        str(workspace),
     ]
     if model and "/" in model:
         args.extend(["-m", model])

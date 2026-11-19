@@ -572,3 +572,110 @@ def _tool_session(parts):
             {"info": {"role": "assistant"}, "parts": parts},
         ],
     }
+
+
+# ---- opencode 2.x export 形状垫片(load_opencode_session 单点归一) ----
+
+
+def _v2_export() -> dict:
+    """opencode 2.0.24 实测形状(2026-11-19 spike):消息顶层 type/text/content,
+    tool part 名在 name、输出在 state.content[].text、无 session 级 agent、含 idle。"""
+    return {
+        "info": {
+            "id": "ses_v2",
+            "projectID": "p1",
+            "model": {"id": "glm-5.3", "providerID": "gateway", "variant": "default"},
+            "outcome": "succeeded",
+            "time": {"created": 1, "updated": 2},
+            "location": {"directory": "/ws"},
+        },
+        "messages": [
+            {
+                "id": "m1",
+                "time": {"created": 10},
+                "type": "user",
+                # 2.x 实测怪癖:user text 双重 JSON 编码(首尾带 ")
+                "text": '"read app.log and report"',
+                "files": [],
+            },
+            {
+                "id": "m2",
+                "time": {"created": 20},
+                "type": "assistant",
+                "agent": "log-error-analyzer",
+                "model": {"id": "glm-5.3", "providerID": "gateway"},
+                "finish": "tool-calls",
+                "content": [
+                    {"type": "reasoning", "text": "先读文件"},
+                    {
+                        "type": "tool",
+                        "id": "call_x1",
+                        "name": "read",
+                        "executed": False,
+                        "state": {
+                            "status": "completed",
+                            "input": {"path": "/ws/logs/app.log"},
+                            "content": [
+                                {"type": "text", "text": "Read file /ws/logs/app.log, lines 1-1\n1: E-AUTH-001 token expired"}
+                            ],
+                            "metadata": {"truncated": False},
+                        },
+                        "time": {"created": 20, "ran": 21, "completed": 22},
+                    },
+                ],
+            },
+            {
+                "id": "m3",
+                "time": {"created": 30},
+                "type": "assistant",
+                "agent": "log-error-analyzer",
+                "finish": "stop",
+                "content": [{"type": "text", "text": "发现 E-FAKE-999(编造)"}],
+            },
+            {"id": "m4", "time": {"created": 40}, "type": "idle", "outcome": "succeeded"},
+        ],
+    }
+
+
+def _write_v2(tmp_path: Path) -> Path:
+    p = tmp_path / "v2-session.json"
+    p.write_text(json.dumps(_v2_export(), ensure_ascii=False), encoding="utf-8")
+    return p
+
+
+def test_load_normalizes_v2_shape_and_drops_idle(tmp_path):
+    sess = load_opencode_session(_write_v2(tmp_path))
+    # idle 丢弃;roles 从顶层 type 归一;主 agent 由 assistant 众数推导
+    assert [m["info"]["role"] for m in sess["messages"]] == ["user", "assistant", "assistant"]
+    assert all(m["info"]["role"] != "idle" for m in sess["messages"])
+    assert sess["info"]["agent"] == "log-error-analyzer"
+    # user 文本 → parts;tool part 名(name→tool)、输出(state.content→state.output)
+    user_parts = sess["messages"][0]["parts"]
+    assert user_parts[0]["text"] == "read app.log and report"
+    tool_part = sess["messages"][1]["parts"][0]
+    assert tool_part["type"] == "tool" and tool_part["tool"] == "read"
+    assert tool_part["state"]["input"] == {"path": "/ws/logs/app.log"}
+    assert tool_part["state"]["output"] == "Read file /ws/logs/app.log, lines 1-1\n1: E-AUTH-001 token expired"
+    # reasoning part 不进 parts(1.x 解析器本就不读思考类)
+    assert [p["type"] for p in sess["messages"][1]["parts"]] == ["tool"]
+
+
+def test_build_digest_from_v2_export(tmp_path):
+    d = build_digest_from_opencode(_write_v2(tmp_path))
+    assert d.skill_used == "log-error-analyzer"  # 众数 agent → skill_used
+    assert d.user_turns == ["read app.log and report"]
+    assert any(tc.name.lower() == "read" for tc in d.tool_trace)
+    # Read 输出进 input_files(共享重建器清洗:去行号前缀)
+    assert d.input_files and d.input_files[0].path.endswith("app.log")
+    assert "E-AUTH-001" in d.input_files[0].content
+    assert "1: E-AUTH-001" not in d.input_files[0].content  # 行号前缀已清
+    # assistant 文本进 transcript_text
+    assert "E-FAKE-999" in d.transcript_text
+
+
+def test_load_v1_shape_passthrough_untouched():
+    """1.x 形状原样透传(幂等):既有 fixture 不经垫片改动。"""
+    sess = load_opencode_session(_LEA_OC)
+    assert sess["info"]["agent"] == "log-error-analyzer"  # 原生 info.agent,非推导
+    for m in sess["messages"]:
+        assert "type" not in m  # 未被改写

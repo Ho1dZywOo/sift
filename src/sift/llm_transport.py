@@ -21,7 +21,9 @@ class LLMCallConfig(NamedTuple):
     timeout: int = 120
     schema: dict | None = None
     max_turns: int | None = None
-    # None = 跟随 SIFT_LLM_TRANSPORT；未设置时保持 cc。
+    # None = 跟随 SIFT_LLM_TRANSPORT(resolve_llm_transport 单点:显式 > env > 调用点 default);
+    # 未设置时保持 cc。判官批的 site default(cc / http 优选批)在 options 层经
+    # transport_default 表达,见 BatchJudgeOptions / call_llm_with_retry。
     transport: str | None = None
     max_tokens: int | None = None
 
@@ -155,12 +157,18 @@ def resolve_http_model(model: str | None) -> str:
     return model[:i] if i != -1 else model
 
 
-def resolve_llm_transport(configured: str | None) -> str:
-    """显式 transport 优先；否则读取 SIFT_LLM_TRANSPORT，最终回退 cc。"""
-    transport = (configured or os.environ.get("SIFT_LLM_TRANSPORT") or "cc").strip().lower()
-    if transport not in {"cc", "http", "dsh"}:
+def resolve_llm_transport(configured: str | None, default: str = "cc") -> str:
+    """transport 决策链单点:显式 ``configured`` > ``SIFT_LLM_TRANSPORT`` > ``default``。
+
+    调用点显式值(用户 --model 级 / 批判官的 site default)仍最高;``configured=None``
+    时环境变量可覆盖 site default —— ``SIFT_LLM_TRANSPORT=opencode`` 即全局一键换
+    判官引擎。site default 由调用点经 ``default`` 表达(http 优选的批传 ``"http"``,
+    主判官批不传用 ``"cc"``),无 env 时行为与历史逐字面一致。
+    """
+    transport = (configured or os.environ.get("SIFT_LLM_TRANSPORT") or default).strip().lower()
+    if transport not in {"cc", "http", "dsh", "opencode"}:
         raise RuntimeError(
-            f"未知 LLM transport: {transport!r}；只支持 cc / http / dsh"
+            f"未知 LLM transport: {transport!r}；只支持 cc / http / dsh / opencode"
             "（可通过 SIFT_LLM_TRANSPORT 设置）"
         )
     return transport
@@ -233,6 +241,74 @@ def call_dsh(
         jsonschema.validate(parsed, schema)
     except jsonschema.ValidationError as exc:
         raise RuntimeError(f"dsh LLM transport returned schema-invalid JSON: {exc.message}") from exc
+    # array 判官解包(与 call_cli/call_http/call_opencode 同约:判官把顶层 array 包成
+    # {"items":[...]} 交协议,transport 透明解开、下游 parser 零改动)。
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return json.dumps(parsed["items"], ensure_ascii=False)
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def call_opencode(
+    prompt: str,
+    config: LLMCallConfig,
+    on_usage: Callable[[dict], None] | None,
+    on_progress: Callable[[str], None] | None = None,
+) -> str:
+    """经 ``opencode run --standalone`` 完成一次判官补全(prompt 内嵌 schema,与 dsh 同型)。
+
+    与 ``call_dsh`` 镜像的三段式:prompt 追加单轮/禁工具/schema 指令 →
+    ``execution/opencode_llm.complete`` 隔离 spawn → 剥 code fence + json.loads +
+    jsonschema 严格校验,失败 RuntimeError(走判官既有重试链)。**不回退 cc**(换判官
+    引擎而非快路径,静默回退会换模型破坏一致性)。schema=None 时纯文本进出
+    (init/add/coverage 文本模式)。模型语义 = opencode 语义:含 ``/`` 才传
+    ``-m provider/model``,裸名走 opencode config 默认模型。
+    """
+    from sift.execution.opencode_llm import complete
+
+    schema = config.schema
+    instructions = [
+        "This is a single-turn non-interactive generation request.",
+        "Do not call tools. Do not ask questions. Return the final answer directly.",
+    ]
+    if schema is not None:
+        instructions.extend(
+            [
+                "Return ONLY one JSON value that conforms to the following JSON Schema.",
+                "Do not wrap it in Markdown fences or add explanatory prose.",
+                json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+    full_prompt = f"{prompt}\n\n" + "\n".join(instructions)
+    _emit_progress(on_progress, "  ↳ opencode transport…")
+    result = complete(full_prompt, model=config.model, timeout=config.timeout)
+    if on_usage is not None and (result.input_tokens or result.output_tokens):
+        # 裸 API 不总给 cost(step_finish 的 cost 缺省 0),payload 形状对齐 call_claude。
+        on_usage(
+            {
+                "input_tokens": result.input_tokens,
+                "output_tokens": result.output_tokens,
+                "total_cost_usd": result.cost_usd,
+            }
+        )
+    text = result.text.strip()
+    if not text:
+        raise RuntimeError("opencode transport returned empty final text")
+    if schema is None:
+        return text
+    candidate = _strip_code_fence(text)
+    try:
+        parsed = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"opencode transport returned invalid JSON: {exc}") from exc
+    import jsonschema
+
+    try:
+        jsonschema.validate(parsed, schema)
+    except jsonschema.ValidationError as exc:
+        raise RuntimeError(f"opencode transport returned schema-invalid JSON: {exc.message}") from exc
+    # array 判官解包(与 call_cli/call_http 同约:{"items":[...]} → 裸 array)。
+    if isinstance(parsed, dict) and isinstance(parsed.get("items"), list):
+        return json.dumps(parsed["items"], ensure_ascii=False)
     return json.dumps(parsed, ensure_ascii=False)
 
 
@@ -438,12 +514,21 @@ def claude_cli_env() -> dict:
     return env
 
 
-def spawn_cli(cmd: list[str], prompt: str, timeout: int) -> str:
-    """跑 claude CLI 子进程、返 stdout 文本。超时 killpg、非零退出 raise。
+def spawn_cli(
+    cmd: list[str],
+    prompt: str,
+    timeout: int,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> str:
+    """跑外部 CLI 子进程(claude / opencode 共用)、返 stdout 文本。超时 killpg、非零退出 raise。
 
     text / json 两条输出格式共用此底层(只管 spawn + 收 stdout,不关心格式)。
+    ``env`` 缺省 = ``claude_cli_env()``;``cwd`` 缺省 = 当前目录 —— opencode 判官
+    transport(``execution/opencode_llm``)传隔离 XDG env + 隔离 cwd(项目级
+    ``opencode.json`` 的 agent 定义在 cwd 里)。
     """
-    env = claude_cli_env()
+    env = claude_cli_env() if env is None else env
     # start_new_session 让外部 CLI(claude/opencode 等通用 backend)在独立进程组,
     # 超时方可 os.killpg 杀整组含其子进程树——这类 CLI 常是 wrapper + node worker,
     # 单 kill 主进程会让 worker 成孤儿、持有 stdout pipe 使 communicate 卡死
@@ -455,6 +540,7 @@ def spawn_cli(cmd: list[str], prompt: str, timeout: int) -> str:
         stderr=subprocess.PIPE,
         text=True,
         env=env,
+        cwd=cwd,
         start_new_session=True,
     )
     try:
@@ -465,13 +551,14 @@ def spawn_cli(cmd: list[str], prompt: str, timeout: int) -> str:
         except (ProcessLookupError, PermissionError):
             logging.getLogger(__name__).debug("Optional operation failed; continuing with fallback", exc_info=True)
         proc.wait()
-        raise RuntimeError(f"claude CLI timed out after {timeout}s") from _caught_error
+        raise RuntimeError(f"{cmd[0]} CLI timed out after {timeout}s") from _caught_error
     if proc.returncode != 0:
         # claude CLI 实测把输出/错误打 stdout、stderr 常空(后端不可用时 exit 1 +
         # stderr 空),只报 stderr 会得到冒号后空白的报错、根因被吞。两条都查才看得到;
-        # 优先 stderr(常规错误通道),空则 fallback stdout。
+        # 优先 stderr(常规错误通道),空则 fallback stdout(opencode 同款:错误以
+        # {"type":"error",...} 事件打 stdout、exit 1)。
         detail = err.strip() or out.strip()
-        raise RuntimeError(f"claude CLI failed (exit {proc.returncode}): {detail[:500]}")
+        raise RuntimeError(f"{cmd[0]} CLI failed (exit {proc.returncode}): {detail[:500]}")
     return out
 
 
@@ -557,7 +644,10 @@ def call_claude(
     forced tool_use 保 schema)。裸 HTTP 撞 529(后端过载/身份限流)/ forced tool_use 拿不到
     tool_use 块(GLM 只回 thinking / thinking 撑满 ``HTTP_MAX_TOKENS`` → ``HttpNoToolUse``)
     → 回退 cc(cc 多轮催出 + 降级文本兜底);其余 HTTP 错(4xx/timeout→RuntimeError)不回退
-    (同 endpoint 无意义)。
+    (同 endpoint 无意义);``"dsh"`` → DSH headless(``call_dsh``,prompt 内嵌 schema +
+    jsonschema 校验,不回退);``"opencode"`` → ``opencode run --standalone``
+    (``call_opencode``,结构性禁工具的自定义判官 agent + 隔离 XDG,模型随 opencode
+    config 走,prompt 内嵌 schema + jsonschema 校验,不回退)。
     默认传输为 ``"cc"``。``on_progress``(可选,http 路内部用):
     截断升档重试 / cc 回退前各报一行进度——判官批与 suggest 单发 40-600s,升档三连时终端
     会静默数分钟,报行让看终端的人知道它在动;不传则零输出(历史行为)。
@@ -574,6 +664,15 @@ def call_claude(
             on_usage=on_usage,
             on_progress=on_progress,
             config=LLMCallConfig(model=model, timeout=timeout, schema=schema),
+        )
+    if transport == "opencode":
+        # 判官补全经 opencode(模型随 opencode config 走);max_turns/max_tokens 无 CLI
+        # 对等(不透传,与 dsh 分支同型 —— opencode 侧结构禁工具后单步直答即终态)。
+        return call_opencode(
+            prompt=prompt,
+            config=LLMCallConfig(model=model, timeout=timeout, schema=schema),
+            on_usage=on_usage,
+            on_progress=on_progress,
         )
     if transport == "http":
         try:
