@@ -196,6 +196,27 @@ def test_complete_missing_cli_raises_loud(monkeypatch):
         oll.complete("p")
 
 
+def test_complete_model_none_failure_appends_default_model_hint(patched_spawn):
+    """model=None 且失败含模型/凭据类关键词 → 报错附「配默认模型或显式传模型」提示
+    (opencode 配置没定默认模型时,内置默认会被继承的 ANTHROPIC_* 劫持到不可用模型)。"""
+    patched_spawn["_raise"] = RuntimeError(
+        'opencode CLI failed (exit 1): {"error":{"message":"Model is unavailable."}}'
+    )
+    with pytest.raises(RuntimeError, match='顶层设 \\"model\\" 字段') as caught:
+        oll.complete("p")  # model=None
+    assert "provider/model" in str(caught.value)
+
+
+def test_complete_model_given_failure_keeps_raw_error(patched_spawn):
+    """显式传了 model → 失败原样上抛,不加默认模型提示(超时/瞬态噪声不掺和)。"""
+    patched_spawn["_raise"] = RuntimeError(
+        'opencode CLI failed (exit 1): {"error":{"message":"Model is unavailable."}}'
+    )
+    with pytest.raises(RuntimeError, match="Model is unavailable") as caught:
+        oll.complete("p", model="gateway/glm-5.3")
+    assert "顶层设" not in str(caught.value)
+
+
 def test_complete_error_event_raises(patched_spawn):
     patched_spawn["_stdout"] = _line({"type": "error", "error": {"message": "Model is unavailable."}})
     with pytest.raises(RuntimeError, match="Model is unavailable"):

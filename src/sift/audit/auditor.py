@@ -131,7 +131,7 @@ from sift.concurrency import (
 from sift.errors import SiftError
 from sift.evals.opencode import transcript_source
 from sift.execution.error_triage import classify_error
-from sift.llm_transport import HttpRateLimited, LLMCallConfig, resolve_llm_transport
+from sift.llm_transport import HttpRateLimited, LLMCallConfig, TransportUnavailable, resolve_llm_transport
 from sift.models import (
     InstructionCheck,
     InstructionSource,
@@ -493,6 +493,14 @@ def judge_batch_with_retry(
             )
             time.sleep(RATE_LIMIT_BACKOFF * (2**attempt) + random.uniform(0, 1))
             continue
+        except TransportUnavailable as exc:
+            # 静态缺位(二进制不在 PATH)是永久错误:不退避不重试,立即按耗尽收尾
+            # (预置 N/A 兜底 + 根因 typed 落 cause_mask,不烧重试预算 × 线性退避空转;
+            # resolve 层通常已先兜底转 opencode,走到这里 = 两 CLI 都缺或显式指定的
+            # 引擎缺失,如实报配置事实)。
+            last_cause = "transport_unavailable"
+            _emit(options.on_progress, f"  {prefix} transport 不可用(不重试): {str(exc)[:120]}")
+            break
         except RuntimeError as exc:
             last_cause = classify_error(str(exc)).root_cause
             _emit(options.on_progress, f"  {prefix} 调用失败: {str(exc)[:120]}")

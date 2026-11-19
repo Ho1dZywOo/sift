@@ -193,6 +193,8 @@ sift run path/to/skill/ --task "重构 X 模块" --cwd ./repo --executor dsh    
 
 DSH 执行器通过 `SIFT_DSH_BIN`（默认 `dsh`）和 `SIFT_DSH_PROFILE`（默认 `headless`）选择二进制与 profile。DSH 自己负责执行器模型和凭据；`SIFT_LLM_TRANSPORT` 控制 SIFT 自己的评分/分析/判官调用，支持 `cc` / `http` / `dsh` / `opencode`，决策链全局统一：显式调用点配置 > `SIFT_LLM_TRANSPORT` > 调用点默认（audit 判官批家族默认 `http`、文本模式默认 `cc`），设置后一键全局切换、无按路径漏网的死角。`SIFT_LLM_TRANSPORT=dsh` 时内部 LLM 调用走当前 DSH headless profile；`SIFT_LLM_TRANSPORT=opencode` 时走 `opencode run --standalone`（判官模型随 opencode 配置走，与智谱 `ANTHROPIC_*` 绑定解耦；`--model` 只认 `provider/model` 形态，裸名走 opencode 配置的默认模型）。判官 opencode 通道结构性禁用工具（判官只准用 prompt 内证据下判，防模型跑工具拿带外证据）、隔离 XDG 跑（不污染本机 opencode 会话库）；schema 靠 prompt 内嵌指令 + 严格校验（与 dsh 同型），无 forced 结构化输出保证。
 
+**静态缺位兜底（桥接）**：resolved 为 cc 而 claude CLI 不在 PATH 时自动转 opencode（转必可见，打一行提示并附固定方式；显式指定的引擎缺位则如实报错、不静默换源——他要的是那个引擎的模型语义）；判官批 http→cc 的回退支线同表驱动（cc 缺位时回退 opencode，不再变死路）。CLI 静态缺位属永久错误，重试壳立即失败不烧退避空转。桥接后未指定 model 时走 opencode 配置的默认模型——**桥接的机器需在 opencode 配置顶层设 `"model"` 字段**（如 `"gateway/glm-5.3"`；不设则 opencode 内置默认可能不可用，报错会附修法提示）。
+
 ### `gate` — 通过/失败判决
 
 对已有 benchmark.json 出 PASS/FAIL/N/A 判决。post-hoc 纯函数（毫秒级，改阈值不重跑 claude）。

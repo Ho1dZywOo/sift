@@ -16,7 +16,7 @@ import random
 import threading
 import time
 
-from sift.llm_transport import HttpRateLimited, LLMCallConfig, resolve_llm_transport
+from sift.llm_transport import HttpRateLimited, LLMCallConfig, TransportUnavailable, resolve_llm_transport
 from sift.utils import call_claude
 
 
@@ -270,6 +270,12 @@ def call_llm_with_retry(
             )
             time.sleep(_LLM_WRAPPER_BACKOFF * (2**attempt) + random.uniform(0, 1))
             continue
+        except TransportUnavailable as exc:
+            # 静态缺位(二进制不在 PATH)是永久错误:不退避不重试,立即以耗尽形态上抛
+            # —— 调用方的 except LLMRetryExhausted 降级路径(grader→UNEVAL 等)不变,
+            # 消息保留原报错,人能看清是环境问题不是瞬态抖动。
+            _emit(on_progress, f"  LLM 调用失败(transport 不可用,不重试): {str(exc)[:120]}")
+            raise LLMRetryExhausted(str(exc)) from exc
         except RuntimeError as exc:
             _emit(on_progress, f"  LLM 调用失败: {str(exc)[:120]}")
             continue

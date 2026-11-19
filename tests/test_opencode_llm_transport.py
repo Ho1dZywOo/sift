@@ -3,12 +3,14 @@
 与 ``test_dsh_llm_transport.py`` 镜像:mock ``opencode_llm.complete``,锁三条主线——
 ① resolve 支持 opencode(+default 参数的决策链语义);② schema 模式的 prompt 注入/
 fence 剥离/jsonschema 校验/items 解包;③ 文本模式透传与 usage 回调形状。全部
-不真跑 opencode。
+不真跑 opencode。另含**静态缺位兜底(桥接层)**:cc 缺位自动转 opencode、必可见、
+单向不回退、http 回退支线表驱动、TransportUnavailable 立即失败。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 
 import pytest
 
@@ -32,6 +34,8 @@ def test_resolve_llm_transport_supports_opencode(monkeypatch):
 def test_resolve_llm_transport_default_param_and_env_precedence(monkeypatch):
     """site default 经 default 参数表达;env 覆盖 site default;显式值覆盖 env。"""
     monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    # 钉死 which(cc 是兜底源,resolve 会探测 claude 在不在;不钉则结果随本机装的 CLI 抖)
+    monkeypatch.setattr(transport.shutil, "which", lambda name: f"/fake/{name}" if name == "claude" else None)
     assert transport.resolve_llm_transport(None, default="http") == "http"
     monkeypatch.setenv("SIFT_LLM_TRANSPORT", "opencode")
     assert transport.resolve_llm_transport(None, default="http") == "opencode"  # env 胜 site default
@@ -135,3 +139,98 @@ def test_call_dsh_items_array_unwrap_parity(monkeypatch):
         ),
     )
     assert json.loads(result) == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# 静态缺位兜底(桥接层):「没装」自动转 + 必可见;「运行时坏」不转、报清楚
+# ---------------------------------------------------------------------------
+
+
+def _pin_which(monkeypatch, present: set[str]):
+    """钉死 which 探测:present 里的 CLI 视为已装,其余缺位(测试不随本机装的 CLI 抖)。"""
+    monkeypatch.setattr(transport.shutil, "which", lambda name: f"/fake/{name}" if name in present else None)
+
+
+def test_resolve_falls_back_to_opencode_when_claude_missing(monkeypatch, caplog):
+    """cc 静态缺位 + opencode 在 → 转 opencode;转必可见(提示含固定方式)。"""
+    monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    _pin_which(monkeypatch, {"opencode"})
+    with caplog.at_level(logging.WARNING):
+        assert transport.resolve_llm_transport(None) == "opencode"
+        # 显式 cc 同样受兜底:他要的是「能跑」,而 cc 不存在是环境事实,不是引擎意图
+        assert transport.resolve_llm_transport("cc") == "opencode"
+    assert "claude CLI 未找到" in caplog.text
+    assert "SIFT_LLM_TRANSPORT=opencode" in caplog.text  # 提示里带「怎么固定」
+
+
+def test_resolve_keeps_cc_when_fallback_target_also_missing(monkeypatch):
+    """cc 缺 + 兜底目标也缺 → 维持 cc(如实,不 mask);由 call_cli 前置检查报清楚。"""
+    monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    _pin_which(monkeypatch, set())
+    assert transport.resolve_llm_transport(None) == "cc"
+
+
+def test_resolve_no_fallback_when_cc_present(monkeypatch):
+    """claude 在 → cc 原样(回归底线:兜底机制不改变已装机器的行为)。"""
+    monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    _pin_which(monkeypatch, {"claude"})
+    assert transport.resolve_llm_transport(None) == "cc"
+
+
+def test_resolve_explicit_engine_missing_never_swapped(monkeypatch):
+    """单向表:显式 opencode 而它缺位 → 维持 opencode 如实报,不静默换回 cc
+    (显式引擎承载模型语义,静默换源破坏判官一致性 + 掩盖配置错误)。"""
+    monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    _pin_which(monkeypatch, {"claude"})
+    assert transport.resolve_llm_transport("opencode") == "opencode"
+
+
+def test_resolve_non_source_transports_never_probed(monkeypatch):
+    """非兜底源(http/dsh)不碰文件系统,行为不随环境抖动。"""
+    monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
+    _pin_which(monkeypatch, set())
+    assert transport.resolve_llm_transport(None, default="http") == "http"
+    assert transport.resolve_llm_transport("dsh") == "dsh"
+
+
+def test_call_cli_missing_binary_raises_transport_unavailable(monkeypatch):
+    """cc 前置检查:缺位报一次清楚 + 指路(不裸抛 FileNotFoundError 进重试链空转);
+    TransportUnavailable 是 RuntimeError 子类(外层降级路径零改动接住)。"""
+    _pin_which(monkeypatch, set())
+    with pytest.raises(transport.TransportUnavailable, match="SIFT_LLM_TRANSPORT=opencode"):
+        transport.call_cli("p", LLMCallConfig(), max_turns=1, on_usage=None)
+    assert issubclass(transport.TransportUnavailable, RuntimeError)
+
+
+def test_http_fallback_targets_opencode_when_cc_missing(monkeypatch):
+    """529 回退支线查兜底表:cc 缺位时回退 opencode,判官批的救命支线在无 claude
+    的机器上不再是死路;call_cli 不被调。"""
+    calls = {"opencode": 0, "cli": 0}
+    monkeypatch.setattr(
+        transport, "call_http", lambda *a, **k: (_ for _ in ()).throw(transport.HttpThrottled("529"))
+    )
+    monkeypatch.setattr(
+        transport, "call_cli", lambda *a, **k: calls.__setitem__("cli", calls["cli"] + 1) or "cc-result"
+    )
+    monkeypatch.setattr(
+        transport, "call_opencode", lambda *a, **k: calls.__setitem__("opencode", calls["opencode"] + 1) or "oc-result"
+    )
+    _pin_which(monkeypatch, {"opencode"})
+    lines: list[str] = []
+    out = transport.call_claude(
+        prompt="p", on_progress=lines.append, config=LLMCallConfig(model="m", transport="http")
+    )
+    assert out == "oc-result"
+    assert calls == {"opencode": 1, "cli": 0}
+    assert any("回退 opencode" in line for line in lines)
+
+
+def test_http_fallback_both_missing_raises_transport_unavailable(monkeypatch):
+    """cc 缺 + opencode 也缺 → 回退目标维持 cc → call_cli 前置检查如实报
+    TransportUnavailable(穿透 call_claude,进重试壳立即失败)。"""
+    monkeypatch.setattr(
+        transport, "call_http", lambda *a, **k: (_ for _ in ()).throw(transport.HttpThrottled("529"))
+    )
+    _pin_which(monkeypatch, set())
+    with pytest.raises(transport.TransportUnavailable, match="claude CLI 未找到"):
+        transport.call_claude(prompt="p", config=LLMCallConfig(model="m", transport="http"))

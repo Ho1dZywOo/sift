@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple
 
 from sift.evals.opencode_db import seed_auth
-from sift.llm_transport import claude_cli_env, spawn_cli
+from sift.llm_transport import TransportUnavailable, claude_cli_env, spawn_cli
 
 #: 自定义判官 agent 名(``opencode.json`` 定义 + ``--agent`` 引用)。
 JUDGE_AGENT_NAME = "sift-judge"
@@ -181,7 +181,10 @@ def complete(
     error 事件 / 零文本)一律 raise RuntimeError,交调用方重试链处置。
     """
     if shutil.which("opencode") is None:
-        raise RuntimeError(
+        # TransportUnavailable(静态缺位,不重试):作为 cc 的兜底目标,自己的缺位同样
+        # 立即失败 —— 重试一个不存在的二进制毫无意义。RuntimeError 基类保持既有
+        # except RuntimeError 降级路径兼容。
+        raise TransportUnavailable(
             "opencode CLI 未找到;SIFT_LLM_TRANSPORT=opencode 需先装 opencode 并确保在 PATH(https://opencode.ai)"
         )
     tmp = Path(tempfile.mkdtemp(prefix="sift-opencode-llm-"))
@@ -214,7 +217,22 @@ def complete(
             "PWD": str(tmp),
         }
         env.pop("OLDPWD", None)
-        stdout = spawn_cli(args, prompt, timeout, env=env, cwd=str(tmp))
+        try:
+            stdout = spawn_cli(args, prompt, timeout, env=env, cwd=str(tmp))
+        except RuntimeError as exc:
+            # 诊断增强(仅未指定 model 时):opencode 的默认模型由其配置决定 —— 机器
+            # 没配默认模型(顶层 "model" 字段)时,opencode 内置默认(anthropic 家族)
+            # 会被继承的 ANTHROPIC_* 劫持到错误端点/模型名 → "Model is unavailable"。
+            # 该提示把「配默认模型或显式传模型」的修法带到错误现场,防operator对着
+            # 上游 400 干瞪眼。关键词圈定在模型/凭据类失败,超时等瞬态不加噪声。
+            if model is None and any(
+                kw in str(exc).lower() for kw in ("model is unavailable", "no authentication", "provider")
+            ):
+                raise RuntimeError(
+                    f"{exc}\n(未指定 model 时走 opencode 配置的默认模型;在 opencode 配置顶层设"
+                    ' "model" 字段(如 "gateway/glm-5.3"),或调用侧显式传 provider/model)'
+                ) from exc
+            raise
 
         text, tokens, cost, stop_reason, error = _parse_stream(stdout)
         if error:

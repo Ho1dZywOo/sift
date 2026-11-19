@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import urllib.error
@@ -60,6 +61,20 @@ class HttpNoToolUse(Exception):
     def __init__(self, message="", stop_reason=None):
         super().__init__(message)
         self.stop_reason = stop_reason
+
+
+class TransportUnavailable(RuntimeError):
+    """transport 的 CLI 二进制静态缺位(不在 PATH)——永久性环境错误,**不重试**。
+
+    与「运行时坏」(凭据过期/网络断/后端 529,瞬态或须人工介入的 RuntimeError)分开:
+    二进制不在 PATH 重试一万次也不会出现,重试只烧退避时间。两个重试壳
+    (``judge_batch_with_retry`` / ``call_llm_with_retry``)对该类型**立即失败**。
+
+    保持 RuntimeError 基类:所有外层 ``except RuntimeError`` 的降级路径(批级 UNRESOLVED
+    兜底、critique/headline 的跳过)零改动接住;cc 缺位时 resolve 层已先按兜底表转
+    opencode(见 ``_TRANSPORT_FALLBACKS``),走到这里说明兜底也不可用/或显式指定的引擎
+    缺失 —— 报错即配置事实,不该被掩盖。
+    """
 
 
 # 裸 HTTP forced tool_use 的输出上限。4096(协议级保守默认,所有 Anthropic 兼容端点都接受;
@@ -157,6 +172,51 @@ def resolve_http_model(model: str | None) -> str:
     return model[:i] if i != -1 else model
 
 
+# ---------------------------------------------------------------------------
+# transport 静态缺位兜底(桥接层)
+#
+# 「没装」是确定性环境事实,机器可自动兜底并大声说;「装了但运行时坏」(凭据/网络/
+# 529)是不确定运行事件,机器只报清楚、把选择权交还给人 —— 两类故障一刀切开是本层
+# 的地基,决定:只对静态缺位转接、转必可见、批内一致(表驱动 + resolve 单点,判官批
+# 一次 resolve 整批复用,天然粘性)。
+# ---------------------------------------------------------------------------
+
+# 各 transport 的 CLI 二进制名。http 无 CLI(直连,永不缺位);dsh 的二进制名可经
+# SIFT_DSH_BIN 改、属执行器域(dsh_runner 自查,raise DshRunnerError 非重试型,同语义)。
+_TRANSPORT_CLI_NAMES: dict[str, str] = {"cc": "claude", "opencode": "opencode"}
+
+# 兜底表:**单向** —— 只有 cc 是源。显式选 opencode/dsh 的人要的是那个引擎的模型语义,
+# 缺了就如实报错(静默换源 = 破坏判官批一致性 + 掩盖配置错误);反向(opencode→cc)不设。
+# 表结构让加方向只是加一行,探测顺序即表序。
+_TRANSPORT_FALLBACKS: dict[str, tuple[str, ...]] = {"cc": ("opencode",)}
+
+
+def _transport_fallback_for(transport: str) -> str:
+    """resolved transport 的 CLI 静态缺位 → 按表找首个可用替代;无替代维持原值。
+
+    纯探测、无副作用(可见提示由调用方发)。非兜底源(http / dsh / opencode / 显式引擎)
+    **不碰文件系统**直接原样返回 —— 行为不随环境抖动。每次现查不缓存:``which`` 一次
+    PATH 扫描 0.1ms 级,对 40-600s 的判官调用可忽略,免缓存失效/测试擦除复杂度、永远新鲜。
+    """
+    alternatives = _TRANSPORT_FALLBACKS.get(transport)
+    if not alternatives or shutil.which(_TRANSPORT_CLI_NAMES[transport]) is not None:
+        return transport
+    for alt in alternatives:
+        if shutil.which(_TRANSPORT_CLI_NAMES[alt]) is not None:
+            return alt
+    return transport
+
+
+def _announce_transport_fallback(from_transport: str, to_transport: str) -> None:
+    """兜底必可见:转接打一行 warning(logging 无 handler 时 lastResort 落 stderr,CLI 直达)。"""
+    logging.warning(
+        "%s CLI 未找到,LLM 调用已转 %s transport(静态缺位兜底);要固定该引擎可显式设 SIFT_LLM_TRANSPORT=%s",
+        _TRANSPORT_CLI_NAMES[from_transport],
+        to_transport,
+        to_transport,
+    )
+
+
 def resolve_llm_transport(configured: str | None, default: str = "cc") -> str:
     """transport 决策链单点:显式 ``configured`` > ``SIFT_LLM_TRANSPORT`` > ``default``。
 
@@ -164,6 +224,11 @@ def resolve_llm_transport(configured: str | None, default: str = "cc") -> str:
     时环境变量可覆盖 site default —— ``SIFT_LLM_TRANSPORT=opencode`` 即全局一键换
     判官引擎。site default 由调用点经 ``default`` 表达(http 优选的批传 ``"http"``,
     主判官批不传用 ``"cc"``),无 env 时行为与历史逐字面一致。
+
+    **静态缺位兜底(桥接)**:resolved 为 cc 而 claude CLI 不在 PATH 时,按
+    ``_TRANSPORT_FALLBACKS`` 表转 opencode 并打一行可见提示 —— 兜底救的是「没装」
+    这种确定性环境事实;「装了但运行时坏」不在此列(那类走 TransportUnavailable /
+    RuntimeError,交给人处理)。判官批一次 resolve、整批复用 → 转接批内天然粘性。
     """
     transport = (configured or os.environ.get("SIFT_LLM_TRANSPORT") or default).strip().lower()
     if transport not in {"cc", "http", "dsh", "opencode"}:
@@ -171,7 +236,10 @@ def resolve_llm_transport(configured: str | None, default: str = "cc") -> str:
             f"未知 LLM transport: {transport!r}；只支持 cc / http / dsh / opencode"
             "（可通过 SIFT_LLM_TRANSPORT 设置）"
         )
-    return transport
+    resolved = _transport_fallback_for(transport)
+    if resolved != transport:
+        _announce_transport_fallback(transport, resolved)
+    return resolved
 
 
 def _strip_code_fence(text: str) -> str:
@@ -567,6 +635,15 @@ def call_cli(prompt, config: LLMCallConfig, max_turns, on_usage):
 
     见 ``call_claude`` 的 docstring(text/json/schema 三模式 + array 解包 + 兜底语义)。
     """
+    if shutil.which("claude") is None:
+        # 前置存在性检查(与 opencode_llm.complete 对齐):缺失时报一次清楚 + 指路,
+        # 不裸抛 FileNotFoundError 进重试链空转。TransportUnavailable 在两个重试壳
+        # 里都是立即失败;resolve 层通常已先兜底转 opencode,走到这里是「兜底也不可用」
+        # (两 CLI 都缺)或显式指定了 cc —— 如实报配置事实。
+        raise TransportUnavailable(
+            "claude CLI 未找到;cc transport 需先装 claude 并确保在 PATH(https://claude.com)。"
+            "本机无 claude 时可设 SIFT_LLM_TRANSPORT=opencode 改走 opencode(模型随 opencode 配置走)"
+        )
     model = config.model
     timeout = config.timeout
     schema = config.schema
@@ -639,7 +716,9 @@ def call_claude(
     模型、超时、schema、轮次和传输设置由 ``config`` 提供；用量及进度回调独立传入。
 
     ``transport``(代码级):显式值优先；未指定时读 ``SIFT_LLM_TRANSPORT``，最终默认
-    ``"cc"``。``"cc"`` → cc CLI(``call_cli``);``"http"`` → 裸 HTTP 直连
+    ``"cc"``(决策链与**静态缺位兜底**见 ``resolve_llm_transport``:claude 不在 PATH
+    时自动转 opencode 并打提示;「装了但运行时坏」不自动换引擎,交
+    ``TransportUnavailable``/RuntimeError 如实报)。``"cc"`` → cc CLI(``call_cli``);``"http"`` → 裸 HTTP 直连
     (``call_http``,省 cc 进程 spawn + ~25k 系统 prompt/批,
     forced tool_use 保 schema)。裸 HTTP 撞 529(后端过载/身份限流)/ forced tool_use 拿不到
     tool_use 块(GLM 只回 thinking / thinking 撑满 ``HTTP_MAX_TOKENS`` → ``HttpNoToolUse``)
@@ -685,11 +764,23 @@ def call_claude(
             )
         except (HttpThrottled, HttpNoToolUse):
             # 529(过载/身份限流)/ forced tool_use 拿不到 tool_use 块(GLM 只回 thinking /
-            # thinking 撑满 max_tokens)→ 回退 cc:cc 多轮 tool_use 循环催出 + 降级文本兜底,
-            # 绕过 http 单次 forced 的结构死结。其它错(4xx/timeout→RuntimeError)不回退——
-            # 同 endpoint 回退无意义。回退也报一行(否则 http 升档三连耗尽后终端又静默几分钟
-            # 换 cc 磨,前后连起来像整个挂死)。
-            _emit_progress(on_progress, "  ↳ http 通道拿不到结果,回退 cc…")
+            # thinking 撑满 max_tokens)→ 回退 CLI 通道:cc 多轮 tool_use 循环催出 + 降级
+            # 文本兜底,绕过 http 单次 forced 的结构死结。其它错(4xx/timeout→RuntimeError)
+            # 不回退——同 endpoint 回退无意义。
+            # 回退目标查兜底表(与 resolve 同一张):cc 缺位时转 opencode —— 判官批的救命
+            # 支线不能在无 claude 的机器上悄悄变死路。回退也报一行(否则 http 升档三连
+            # 耗尽后终端又静默几分钟换引擎磨,前后连起来像整个挂死)。
+            target = _transport_fallback_for("cc")
+            if target != "cc":
+                _announce_transport_fallback("cc", target)
+            _emit_progress(on_progress, f"  ↳ http 通道拿不到结果,回退 {target}…")
+            if target == "opencode":
+                return call_opencode(
+                    prompt=prompt,
+                    config=LLMCallConfig(model=model, timeout=timeout, schema=schema),
+                    on_usage=on_usage,
+                    on_progress=on_progress,
+                )
             return call_cli(
                 prompt=prompt,
                 max_turns=max_turns,
