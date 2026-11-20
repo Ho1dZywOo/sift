@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Callable
 
 from sift.errors import ExecutionError
-from sift.evals.opencode_db import isolated_xdg_env_seeded, run_opencode
+from sift.evals.opencode_db import isolated_xdg_env_seeded, opencode_version, run_opencode
 from sift.execution.cli_runner import build_live_prompt
 from sift.execution.options import ExecutionOptions
 from sift.models import RunOutput
@@ -125,7 +125,7 @@ class OpenCodeRunner:
         injected = build_live_prompt(prompt, skill_path)
         workspace = cwd or Path.cwd()
 
-        args = _opencode_run_command(injected, model)
+        args = _opencode_run_command(injected, model, workspace)
 
         start = time.time()
         # 隔离 XDG seed 版:会话落一次性 db 不碰真库,同时 cp 真实 auth.json ——
@@ -208,25 +208,49 @@ def _collect_opencode_output(proc, timeout: int, on_progress: Callable[[str], No
 def _export_opencode_session(xdg: Path, stderr: str) -> str:
     """从本次隔离数据库导出原始会话，保留缺失会话时的诊断。
 
-    opencode 2.x 形态:列 session 走 server API(``api --standalone GET /api/session``,
-    不按调用方 cwd 项目过滤 —— CLI ``session list`` 会过滤,session 的 directory=
-    workspace 与隔离 cwd 不匹配会列空),导出走 ``session export --standalone``
-    (顶层 ``export`` 子命令已删)。全部 ``--standalone``:否则连后台共享 service
-    读真库,隔离 db 读不到(service 持有操作员 env,客户端 XDG 被忽略;spike 实证)。
+    选会话:**先剔除子会话**(带 ``parentID`` 的 subagent 子会话 —— 本机真库 API 实证
+    字段名;子会话可能比主会话更晚 updated,按 updated 取最新会误选 child,后续审计
+    拿不到完整主任务记录),再按 ``updated`` desc 取最新。
+
+    命令面按版本分叉(``opencode_version`` 判定):
+
+    - **2.x**:列 session 走 server API(``api --standalone GET /api/session``,不按
+      调用方 cwd 项目过滤 —— CLI ``session list`` 会过滤,session 的 directory=
+      workspace 与隔离 cwd 不匹配会列空),导出走 ``session export --standalone``
+      (顶层 ``export`` 子命令已删)。全部 ``--standalone``:否则连后台共享 service
+      读真库,隔离 db 读不到(service 持有操作员 env,客户端 XDG 被忽略;spike 实证)。
+    - **1.x**:CLI ``session list --format json`` + 顶层 ``export <sid>``
+      (main 原形态,1.19.5 验证;无后台 service,XDG env 直接生效)。
     """
-    try:
-        out = run_opencode(xdg, ["api", "--standalone", "GET", "/api/session"])
-        data = json.loads(out.strip() or "{}")
-    except json.JSONDecodeError:
-        data = {}
-    items = data.get("data") if isinstance(data, dict) else None
-    if not items:
+    major = opencode_version()[0]
+    if major >= 2:
+        try:
+            out = run_opencode(xdg, ["api", "--standalone", "GET", "/api/session"])
+            data = json.loads(out.strip() or "{}")
+        except json.JSONDecodeError:
+            data = {}
+        items = (data.get("data") if isinstance(data, dict) else None) or []
+    else:
+        try:
+            items = json.loads(
+                run_opencode(xdg, ["session", "list", "--format", "json"]).strip() or "[]"
+            )
+        except json.JSONDecodeError:
+            items = []
+    # 子会话剔除(带 parentID 跳过;字段不存在时 .get 为 None,1.x 无此字段不受影响)。
+    # 极端情形(列出的全是子会话)不空手而归:如实导最新一条,错误信息可见好排。
+    top_level = [s for s in items if not s.get("parentID")] or items
+    if not top_level:
         raise ExecutionError(f"opencode run 未持久化 session(无法 export;stderr: {stderr[:300]})")
-    # 隔离 XDG db 是 fresh 的,只含本次 opencode run 刚建的那条 session → 按 updated
-    # desc 取最新即它;若 opencode 将来会额外建辅助 session,按 timestamp 过滤仍稳。
-    items.sort(key=lambda s: ((s.get("time") or {}).get("updated") or 0), reverse=True)
-    sid = items[0].get("id", "")
-    transcript_json = run_opencode(xdg, ["session", "export", "--standalone", sid])  # 原文,不 sanitize
+    # 隔离 XDG db 是 fresh 的,只含本次 opencode run 刚建的会话 → 剔除子会话后按 updated
+    # desc 取最新即它;若 opencode 将来会额外建辅助会话,按 timestamp 过滤仍稳。
+    if major >= 2:
+        sid = max(top_level, key=lambda s: ((s.get("time") or {}).get("updated") or 0)).get("id", "")
+        export_args = ["session", "export", "--standalone", sid]
+    else:
+        sid = max(top_level, key=lambda s: (s.get("updated") or 0)).get("id", "")
+        export_args = ["export", sid]
+    transcript_json = run_opencode(xdg, export_args)  # 原文,不 sanitize
 
     return transcript_json
 
@@ -253,8 +277,15 @@ def _read_opencode_stderr(proc, stderr_chunks: list[str]) -> None:
         stderr_chunks.append(raw.decode("utf-8", errors="replace"))
 
 
-def _opencode_run_command(injected: str, model: str | None) -> list[str]:
-    """opencode 2.x 的 run 参数(2026-11-19 spike 实证适配,本机 2.0.24):
+def _opencode_run_command(injected: str, model: str | None, workspace: Path) -> list[str]:
+    """按 opencode 版本构造 run 参数(1.x/2.x 命令面分叉,``opencode_version`` 判定)。
+
+    **1.x**(≤1.19 形态,main 原样,1.19.5 验证):
+
+    - 有 ``--dir``(目录 flag 尚在),无 ``--standalone``(1.x 无后台共享 service,
+      ``XDG_DATA_HOME`` 等客户端 env 直接生效,隔离不靠私有 server)。
+
+    **2.x**(2026-11-19 spike 实证适配,本机 2.0.24):
 
     - **无 ``--dir`` flag**:2.x 已移除(传了直接 usage 报错 exit 1)——目录经进程
       cwd(``Popen(cwd=workspace)``)控制,opencode 从 cwd 做项目发现。
@@ -262,17 +293,13 @@ def _opencode_run_command(injected: str, model: str | None) -> list[str]:
       操作员真实 env → 客户端 ``XDG_DATA_HOME`` 被完全忽略、session 落真库、隔离目录
       里连 db 都不出现(隔离 + export 机制整个失效,还会污染操作员会话库)。
       standalone 每次私有 server + 客户端 env 生效 + session 落隔离一次性 db。
-    - ``--dangerously-skip-permissions`` 在 2.x 仍兼容(隐藏别名,实测 exit 0)。
+    - ``--dangerously-skip-permissions`` 两代均兼容(2.x 为隐藏别名,实测 exit 0)。
     - model 含 ``/`` 才传 ``-m``(裸名 opencode API 不认 → 跳过走 config 默认)。
     """
-    args = [
-        "opencode",
-        "run",
-        "--standalone",
-        "--format",
-        "json",
-        "--dangerously-skip-permissions",
-    ]
+    if opencode_version()[0] >= 2:
+        args = ["opencode", "run", "--standalone", "--format", "json", "--dangerously-skip-permissions"]
+    else:
+        args = ["opencode", "run", "--format", "json", "--dangerously-skip-permissions", "--dir", str(workspace)]
     if model and "/" in model:
         args.extend(["-m", model])
     args.append(injected)

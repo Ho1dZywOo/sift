@@ -18,6 +18,73 @@ import pytest
 import sift.evals.opencode_db as ocdb
 from sift.errors import ExecutionError, OpencodeDbError
 
+# 版本探测默认钉死 2.0.24(经进程内缓存注入,不打真 CLI):list/export 的 1.x/2.x
+# 分支测试各自覆写缓存;1.x/2.x 分叉是本模块的被测行为,不能依赖本机装的是哪代。
+@pytest.fixture(autouse=True)
+def _pin_version_cache(monkeypatch):
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", (2, 0, 24))
+
+
+# ---- opencode_version(版本探测)----
+
+
+def test_opencode_version_parses_v_prefix(monkeypatch):
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", None)
+    monkeypatch.setattr(ocdb.shutil, "which", lambda name: "/fake/opencode")
+    monkeypatch.setattr(
+        ocdb.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="opencode v2.0.24\n", stderr=""),
+    )
+    assert ocdb.opencode_version() == (2, 0, 24)
+
+
+def test_opencode_version_parses_bare_triplet(monkeypatch):
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", None)
+    monkeypatch.setattr(ocdb.shutil, "which", lambda name: "/fake/opencode")
+    monkeypatch.setattr(
+        ocdb.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="opencode 1.19.5", stderr=""),
+    )
+    assert ocdb.opencode_version() == (1, 19, 5)
+
+
+def test_opencode_version_caches_across_calls(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="opencode v2.0.24", stderr="")
+
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", None)
+    monkeypatch.setattr(ocdb.shutil, "which", lambda name: "/fake/opencode")
+    monkeypatch.setattr(ocdb.subprocess, "run", fake_run)
+    assert ocdb.opencode_version() == (2, 0, 24)
+    assert ocdb.opencode_version() == (2, 0, 24)
+    assert calls == [["opencode", "--version"]], "进程内只探一次"
+
+
+def test_opencode_version_missing_cli_raises(monkeypatch):
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", None)
+    monkeypatch.setattr(ocdb.shutil, "which", lambda name: None)
+    with pytest.raises(RuntimeError, match="opencode CLI 未找到"):
+        ocdb.opencode_version()
+
+
+def test_opencode_version_unparseable_output_raises(monkeypatch):
+    """探不出 → 报原文,不猜默认(猜错分支比报错贵)。"""
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", None)
+    monkeypatch.setattr(ocdb.shutil, "which", lambda name: "/fake/opencode")
+    monkeypatch.setattr(
+        ocdb.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="garbage", stderr="boom"),
+    )
+    with pytest.raises(RuntimeError, match="无法解析"):
+        ocdb.opencode_version()
+
+
 # ---- OpencodeDbError 层级 ----
 
 
@@ -250,6 +317,38 @@ def test_list_sessions_garbage_raises(monkeypatch, tmp_path):
         ocdb.list_sessions(db)
 
 
+def test_list_sessions_v1_uses_cli_session_list(monkeypatch, tmp_path):
+    """1.x:无 server API,CLI ``session list --format json`` 即全量(main 原形态);
+    行为平铺(updated 直读,非 2.x 的 time.updated 嵌套)。"""
+    db = tmp_path / "handed.db"
+    db.write_bytes(b"x")
+    cmds = []
+    rows = [{"id": "ses_a", "updated": 100, "title": "A"}, {"id": "ses_b", "updated": 200}]
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(rows), stderr="")
+
+    monkeypatch.setattr(ocdb.subprocess, "run", fake_run)
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", (1, 19, 5))
+
+    sessions = ocdb.list_sessions(db)
+    assert [s["id"] for s in sessions] == ["ses_b", "ses_a"]  # updated desc
+    assert cmds == [["opencode", "session", "list", "--format", "json"]]
+
+
+def test_list_sessions_v1_empty_output_returns_empty(monkeypatch, tmp_path):
+    db = tmp_path / "handed.db"
+    db.write_bytes(b"x")
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", (1, 19, 5))
+    monkeypatch.setattr(
+        ocdb.subprocess,
+        "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+    assert ocdb.list_sessions(db) == []
+
+
 # ---- export_session ----
 
 _EXPORT_JSON = json.dumps({"info": {"id": "ses_x", "agent": "build"}, "messages": []})
@@ -301,6 +400,24 @@ def test_export_session_non_session_shape_raises(monkeypatch, tmp_path):
     )
     with pytest.raises(OpencodeDbError, match="合法"):
         ocdb.export_session(db, "ses_x")
+
+
+def test_export_session_v1_uses_top_level_export(monkeypatch, tmp_path):
+    """1.x:顶层 ``export <sid>``(main 原形态;2.x 已删挪到 session export)。"""
+    db = tmp_path / "handed.db"
+    db.write_bytes(b"x")
+    cmds = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=_EXPORT_JSON, stderr="")
+
+    monkeypatch.setattr(ocdb.subprocess, "run", fake_run)
+    monkeypatch.setattr(ocdb, "_opencode_version_cache", (1, 19, 5))
+
+    out = ocdb.export_session(db, "ses_x")
+    assert json.loads(out)["info"]["id"] == "ses_x"
+    assert cmds == [["opencode", "export", "ses_x"]]
 
 
 # ---- resolve_session(纯策略,无 mock)----

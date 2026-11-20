@@ -86,6 +86,21 @@ def load_opencode_session(path: Path) -> dict:
         if counts:
             info["agent"] = max(counts, key=counts.get)
     msgs.sort(key=lambda m: ((m.get("info") or {}).get("time") or {}).get("created", 0))
+
+    # 2.x user 消息无 agent 字段(export 实测:user 顶层只有 files/id/text/time/type),
+    # 但 agent/root 切片按 ``info.agent`` 过滤 → 用户请求会被整段丢掉(切片只剩
+    # assistant、``digest.user_turns`` 为空 → 遵循性失判)。归属规则:**用户消息归
+    # 「下一条 assistant」的 agent** —— 会话内用户消息总是发给当时激活的 agent,
+    # 回应者即归属者(与 agent-switched 语义一致);尾部悬空(无后续 assistant)
+    # 保持无 agent,不属于任何段。1.x 透传消息自带 agent,``not agent`` 守卫不碰它。
+    next_agent: str | None = None
+    for m in reversed(msgs):
+        minfo = m.get("info") or {}
+        if minfo.get("role") == "assistant" and minfo.get("agent"):
+            next_agent = minfo["agent"]
+        elif minfo.get("role") == "user" and not minfo.get("agent") and next_agent:
+            minfo["agent"] = next_agent
+            m["info"] = minfo
     return {"info": info, "messages": msgs}
 
 

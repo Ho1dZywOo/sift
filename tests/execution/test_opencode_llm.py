@@ -169,6 +169,9 @@ def patched_spawn(monkeypatch):
     monkeypatch.setattr(mod, "spawn_cli", fake_spawn_cli)
     monkeypatch.setattr(mod, "seed_auth", fake_seed_auth)
     monkeypatch.setattr(mod.tempfile, "mkdtemp", tracking_mkdtemp)
+    # 版本门钉死(默认 2.0.24;单测可置 cap["version"] 覆写)——真探测在 CI 无
+    # opencode 的环境会炸,且测试要的就是不依赖本机版本。
+    monkeypatch.setattr(mod, "opencode_version", lambda: cap.get("version", (2, 0, 24)))
     return cap
 
 
@@ -205,8 +208,12 @@ def test_complete_spawn_shape_and_isolation(patched_spawn):
     assert "OLDPWD" not in call["env"]
     # opencode.json(agent 定义)写进 cwd;auth seed 进 tmp/opencode/auth.json
     agent = patched_spawn["agent_config"]["agents"][oll.JUDGE_AGENT_NAME]
-    assert all(v is False for v in agent["tools"].values()), "判官 agent 必须结构性禁全部工具"
-    assert "Never use tools" in agent["prompt"]
+    # V2 形态:permissions deny-all 规则结构性封工具 + steps=1 末步移除工具双闸
+    # (官方文档明令 V1 的 prompt/tools 在 V2 禁用;2026-11-20 本机 2.0.24 实证)。
+    assert agent["permissions"] == [{"action": "*", "resource": "*", "effect": "deny"}], "判官 agent 必须 deny-all 封全部工具"
+    assert agent["steps"] == 1
+    assert "Never use tools" in agent["system"]
+    assert "tools" not in agent and "prompt" not in agent, "V1 字段(prompt/tools)在 V2 配置中禁用"
     assert patched_spawn["seed_calls"] == [f"{cwd}/opencode/auth.json"]
 
     assert result.text == '{"ok": 1}'
@@ -227,6 +234,17 @@ def test_complete_missing_cli_raises_loud(monkeypatch):
     monkeypatch.setattr(mod.shutil, "which", lambda name: None)
     with pytest.raises(RuntimeError, match="opencode CLI 未找到"):
         oll.complete("p")
+
+
+def test_complete_version_gate_rejects_v1(patched_spawn):
+    """1.x 无 --standalone/私有 server 与 agent V2 定义 → TransportUnavailable(静态
+    环境事实,不重试),报当前版本并指路换引擎;2.x 正常放行。"""
+    patched_spawn["version"] = (1, 19, 5)
+    with pytest.raises(RuntimeError, match=r"opencode 判官 transport 需 opencode ≥ 2\.0") as caught:
+        oll.complete("p")
+    assert "1.19.5" in str(caught.value)
+    assert "cc/http/dsh" in str(caught.value)
+    assert patched_spawn["spawn_calls"] == [], "版本门须在 spawn 前拦下"
 
 
 def test_complete_model_none_failure_appends_default_model_hint(patched_spawn):

@@ -660,6 +660,46 @@ def test_load_normalizes_v2_shape_and_drops_idle(tmp_path):
     assert [p["type"] for p in sess["messages"][1]["parts"]] == ["tool"]
 
 
+def test_load_v2_user_message_gets_next_assistant_agent(tmp_path):
+    """评审复现:2.x user 消息无 agent 字段(export 实测),按 agent/root 切片只保留
+    info.agent 匹配的消息 → 用户请求被整段丢掉、digest.user_turns 空。归属规则:
+    用户消息归「下一条 assistant」的 agent(回应者即归属者)。"""
+    sess = load_opencode_session(_write_v2(tmp_path))
+    user = sess["messages"][0]
+    assert user["info"]["role"] == "user"
+    assert user["info"]["agent"] == "log-error-analyzer", "user 须归到下一条 assistant 的 agent"
+
+
+def test_slice_v2_user_request_not_dropped_from_agent_slice(tmp_path):
+    """评审原始复现闭环:「用户请求 + 目标 agent 回复」→ 切片必须同时保留 user 与
+    assistant(修复前切片只剩 assistant,digest.user_turns 为空 → 遵循性失判)。"""
+    from sift.evals.opencode import slice_opencode_by_agent
+
+    segments = slice_opencode_by_agent(_write_v2(tmp_path), "log-error-analyzer")
+    assert len(segments) == 1
+    roles = [m["info"]["role"] for m in segments[0]["messages"]]
+    assert roles == ["user", "assistant", "assistant"], "用户请求必须留在 agent 切片里"
+    # 切片重建 digest:user_turns 非空(修复前为空)
+    seg_path = tmp_path / "seg.json"
+    seg_path.write_text(json.dumps(segments[0], ensure_ascii=False), encoding="utf-8")
+    d = build_digest_from_opencode(seg_path)
+    assert d.user_turns == ["read app.log and report"]
+
+
+def test_load_v2_trailing_user_without_assistant_has_no_agent(tmp_path):
+    """尾部悬空 user(无后续 assistant)→ 保持无 agent,不属于任何段(不硬造归属)。"""
+    sess = _v2_export()
+    sess["messages"].append(
+        {"id": "m5", "time": {"created": 50}, "type": "user", "text": '"orphan"', "files": []}
+    )
+    p = tmp_path / "trailing-user.json"
+    p.write_text(json.dumps(sess, ensure_ascii=False), encoding="utf-8")
+    loaded = load_opencode_session(p)
+    trailing = loaded["messages"][-1]
+    assert trailing["info"]["role"] == "user"
+    assert not trailing["info"].get("agent")
+
+
 def test_build_digest_from_v2_export(tmp_path):
     d = build_digest_from_opencode(_write_v2(tmp_path))
     assert d.skill_used == "log-error-analyzer"  # 众数 agent → skill_used

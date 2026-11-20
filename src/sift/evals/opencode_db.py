@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +45,41 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from sift.errors import OpencodeDbError
+
+#: ``opencode --version`` 进程内缓存(版本不变,探一次就够;测试 monkeypatch 本函数,
+#: 缓存由 ``monkeypatch.setattr(opencode_db, "_opencode_version_cache", None)`` 复位)。
+_opencode_version_cache: tuple[int, int, int] | None = None
+
+
+def opencode_version() -> tuple[int, int, int]:
+    """``opencode --version`` → ``(major, minor, patch)``,进程内缓存一次。
+
+    1.x/2.x 命令面分叉的判定基础(runner 的 run/export、db 的 list/export、判官
+    transport 的最低版本门)。可见原则:探不出 → RuntimeError 报原文,**不猜默认**
+    —— 猜错分支比报错贵(1.x 机器跑 2.x 命令是 usage 报错,2.x 机器跑 1.x 命令
+    是共享 service 吞掉隔离 env、会话落真库)。
+    """
+    global _opencode_version_cache
+    if _opencode_version_cache is not None:
+        return _opencode_version_cache
+    if shutil.which("opencode") is None:
+        raise RuntimeError(
+            "opencode CLI 未找到:opencode 路径(执行器 / audit --db / 判官 transport)需先装 opencode 并确保在 PATH(https://opencode.ai)"
+        )
+    try:
+        proc = subprocess.run(
+            ["opencode", "--version"], capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"opencode --version 执行失败: {exc}") from exc
+    out = (proc.stdout or "").strip() or (proc.stderr or "").strip()
+    m = re.search(r"v?(\d+)\.(\d+)\.(\d+)", out)
+    if proc.returncode != 0 or not m:
+        raise RuntimeError(
+            f"opencode --version 输出无法解析(exit {proc.returncode}): {out[:200]!r}"
+        )
+    _opencode_version_cache = (int(m[1]), int(m[2]), int(m[3]))
+    return _opencode_version_cache
 
 
 def run_opencode(xdg_dir: Path, args: list[str], timeout: int = 120) -> str:
@@ -176,12 +212,30 @@ def _normalize_api_session(raw: dict) -> dict:
 def list_sessions(db_path: Path) -> list[dict]:
     """列出 opencode db 里**所有** session,按 ``updated`` desc(新→旧)返回。
 
-    opencode 2.x 的 ``opencode session list``(CLI)按调用方 cwd 项目过滤 —— 外来 db
-    的 session directory 是原机路径,任何本机 cwd 都列不出来(spike 实证)。全量通道是
-    server API:``opencode api --standalone GET /api/session``(不按项目过滤,带 cursor
-    翻页,畸形 cursor → HTTP 400 可检测)。输出经 ``_normalize_api_session`` 规整成
-    下游消费形状(audit --db 的表列 id/title/updated)。
+    命令面按版本分叉(``opencode_version`` 判定):
+
+    - **2.x**:CLI ``session list`` 按调用方 cwd 项目过滤 —— 外来 db 的 session
+      directory 是原机路径,任何本机 cwd 都列不出来(spike 实证)。全量通道是
+      server API:``opencode api --standalone GET /api/session``(不按项目过滤,带
+      cursor 翻页,畸形 cursor → HTTP 400 可检测),输出经 ``_normalize_api_session``
+      规整成下游消费形状(audit --db 的表列 id/title/updated)。
+    - **1.x**:CLI ``session list --format json`` 即全量(无 server API/cursor;
+      main 原形态,1.19.5 验证),行为 ``{id, title, updated, created, projectId, directory}``。
     """
+    if opencode_version()[0] < 2:
+        with isolated_xdg_env(db_path) as xdg:
+            out = run_opencode(xdg, ["session", "list", "--format", "json"])
+        stripped = out.strip()
+        if not stripped:
+            return []
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            raise OpencodeDbError(f"opencode session list 输出无法解析为 JSON: {stripped[:200]!r}") from exc
+        if not isinstance(data, list):
+            raise OpencodeDbError(f"opencode session list 输出非数组: {str(data)[:200]}")
+        return sorted(data, key=lambda s: s.get("updated", 0) or 0, reverse=True)
+
     items: list[dict] = []
     with isolated_xdg_env(db_path) as xdg:
         cursor: str | None = None
@@ -211,9 +265,13 @@ def export_session(db_path: Path, session_id: str, sanitize: bool = False) -> st
 
     输出非合法 session JSON → ``OpencodeDbError``。
     """
-    # opencode 2.x:export 顶层子命令已删(挪到 ``session export``),必须 ``--standalone``
-    # —— 否则连后台共享 service 读真库,隔离 db 完全读不到(服务持有操作员 env)。
-    args = ["session", "export", "--standalone", session_id]
+    if opencode_version()[0] < 2:
+        # 1.x:顶层 ``export`` 子命令(main 原形态;2.x 已删,挪到 session export)。
+        args = ["export", session_id]
+    else:
+        # opencode 2.x:export 顶层子命令已删(挪到 ``session export``),必须 ``--standalone``
+        # —— 否则连后台共享 service 读真库,隔离 db 完全读不到(服务持有操作员 env)。
+        args = ["session", "export", "--standalone", session_id]
     if sanitize:
         args.append("--sanitize")
     with isolated_xdg_env(db_path) as xdg:

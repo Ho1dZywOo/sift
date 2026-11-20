@@ -195,6 +195,8 @@ DSH 执行器通过 `SIFT_DSH_BIN`（默认 `dsh`）和 `SIFT_DSH_PROFILE`（默
 
 **静态缺位兜底（桥接）**：resolved 为 cc 而 claude CLI 不在 PATH 时自动转 opencode（转必可见，打一行提示并附固定方式；显式指定的引擎缺位则如实报错、不静默换源——他要的是那个引擎的模型语义）；判官批 http→cc 的回退支线同表驱动（cc 缺位时回退 opencode，不再变死路）。CLI 静态缺位属永久错误，重试壳立即失败不烧退避空转。桥接后未指定 model 时走 opencode 配置的默认模型——**桥接的机器需在 opencode 配置顶层设 `"model"` 字段**（如 `"gateway/glm-5.3"`；不设则 opencode 内置默认可能不可用，报错会附修法提示）。
 
+**OpenCode 版本支持矩阵**：opencode 1.x 与 2.x 的 CLI 命令面不兼容（2.x 删除顶层 `export` 子命令、`run` 默认连后台共享 service、`--dir` 被移除），sift 运行时按 `opencode --version` 自动分叉命令构造——**执行器（`run --executor opencode`）与审计入口（`audit --db`）双版本支持（1.x 实测 1.19.5 / 2.x 实测 2.0.24）**；**判官 transport（`SIFT_LLM_TRANSPORT=opencode`）仅支持 ≥ 2.0**（`--standalone` 私有 server、agent V2 定义、2.x 事件流均无 1.x 对应物，1.x 上如实报 TransportUnavailable 并提示改用 `cc`/`http`/`dsh`）。版本探不出的环境直接报错原文，不猜默认。
+
 ### `gate` — 通过/失败判决
 
 对已有 benchmark.json 出 PASS/FAIL/N/A 判决。post-hoc 纯函数（毫秒级，改阈值不重跑 claude）。

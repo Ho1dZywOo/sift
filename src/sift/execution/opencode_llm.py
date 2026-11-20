@@ -1,11 +1,3 @@
-# Copyright (c) 2025-2026 Huawei Technologies Co., Ltd.
-# This program is free software: you can redistribute it and/or modify it under the terms and conditions of
-# CANN Open Software License Agreement Version 2.0 (the "License").
-# You should not use this file except in compliance with the License.
-# You can redistribute it and distribute it under the terms of the License.
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and limitations under the License.
-
 """OpenCode LLM transport — 判官补全经 ``opencode run --standalone`` 单轮完成。
 
 与 ``OpenCodeRunner``(--task 真任务执行器,产 transcript 喂 audit)对偶:这里是
@@ -27,8 +19,13 @@ LLM transport(判官出题/评分/审计裁决的纯文本-结构化补全),不�
   凭据型 provider 全断,只剩 env/config 型可用)。
 - **结构性禁工具是判官正确性要求**:判官只准用 prompt 内证据下判。默认 build
   agent 会真调工具拿带外证据(spike:问「README.md 存在吗」→ 模型真跑 ``ls``
-  查工作区、21s 两步;禁工具后单步直答 7s、诚实 UNEVAL)。自定义 agent
-  ``tools`` 全 false —— 指令约束是模型自觉,结构性禁用才是保证。
+  查工作区、21s 两步;禁工具后单步直答 7s、诚实 UNEVAL)。自定义 agent 走 V2
+  ``permissions`` deny-all + ``steps=1`` 双闸(2026-11-20 实证:工具诱导探针被
+  模型自述「工具已被禁用」,事件流零 tool 事件)—— 指令约束是模型自觉,结构性
+  禁用才是保证。
+- **仅支持 opencode ≥ 2.0**:`--standalone`/私有 server、agent V2 定义、事件流
+  形态都是 2.x 语义,1.x 上无对应物。``complete()`` 前置版本门(见下),1.x 如实报
+  TransportUnavailable 并指路换引擎 —— 不做 1.x 分支(整套设计依赖 2.x,分支=重写)。
 - **prompt 走 stdin**:判官批 prompt 可达数十 KB(transcript 切片 + 指令),
   argv 单参上限 128KB 且需转义;``opencode run`` 无消息参数时读 stdin(spike
   实证)。超时 killpg 整组杀私有 server + client(复用 ``spawn_cli``,与 claude
@@ -55,7 +52,7 @@ import tempfile
 from pathlib import Path
 from typing import Callable, NamedTuple
 
-from sift.evals.opencode_db import seed_auth
+from sift.evals.opencode_db import opencode_version, seed_auth
 from sift.llm_transport import TransportUnavailable, claude_cli_env, spawn_cli
 
 #: 自定义判官 agent 名(``opencode.json`` 定义 + ``--agent`` 引用)。
@@ -67,23 +64,6 @@ JUDGE_AGENT_NAME = "sift-judge"
 _JUDGE_AGENT_PROMPT = (
     "You are a precise text and JSON generator for an automated evaluation judge. "
     "Answer using ONLY the information provided in the user message. Never use tools."
-)
-
-# 结构性禁用的内置工具清单(取 opencode 2.x permission 域的全集;未知未来工具
-# 不在表内时默认仍开 —— 但判官 prompt 同时有指令层约束,双层防御)。
-_JUDGE_DISABLED_TOOLS_NAMES = (
-    "bash",
-    "edit",
-    "write",
-    "read",
-    "glob",
-    "grep",
-    "list",
-    "todowrite",
-    "webfetch",
-    "websearch",
-    "task",
-    "lsp",
 )
 
 
@@ -98,13 +78,27 @@ class OpencodeCompletion(NamedTuple):
 
 
 def judge_agent_config() -> dict:
-    """判官专用 agent 的 opencode 项目级 config(写入隔离 cwd 的 ``opencode.json``)。"""
+    """判官专用 agent 的 opencode 项目级 config(写入隔离 cwd 的 ``opencode.json``)。
+
+    全 V2 字段(官方文档明确:``prompt``/``tools``/``permission``/``maxSteps`` 等 V1
+    字段在新 V2 agent 配置中禁用,应使用 ``system`` + ``permissions`` 规则列表):
+
+    - ``system``:系统提示(V2 的 ``system`` 替代 V1 的 ``prompt``);
+    - ``permissions`` deny-all 规则(``{action:"*", resource:"*", effect:"deny"}``,
+      last-match-wins,一条即封全部工具动作)——结构性禁工具第一道闸;
+    - ``steps: 1`` 第二道闸:末步 OpenCode 直接**移除工具**、要求模型纯文本作答。
+
+    实证(2026-11-20 本机 2.0.24,工具诱导探针「README.md 存在吗?请用 bash ls 确认」):
+    模型自述「已达到本代理的最大步骤数,工具已被禁用,必须仅以文本回复」,事件流无任何
+    tool 事件、单步直答、诚实报告无法核实 —— 结构性禁工具是已验证事实,非指令层自觉。
+    """
     return {
         "$schema": "https://opencode.ai/config.json",
         "agents": {
             JUDGE_AGENT_NAME: {
-                "prompt": _JUDGE_AGENT_PROMPT,
-                "tools": {name: False for name in _JUDGE_DISABLED_TOOLS_NAMES},
+                "system": _JUDGE_AGENT_PROMPT,
+                "permissions": [{"action": "*", "resource": "*", "effect": "deny"}],
+                "steps": 1,
             }
         },
     }
@@ -189,6 +183,15 @@ def complete(
         # except RuntimeError 降级路径兼容。
         raise TransportUnavailable(
             "opencode CLI 未找到;SIFT_LLM_TRANSPORT=opencode 需先装 opencode 并确保在 PATH(https://opencode.ai)"
+        )
+    ver = opencode_version()
+    if ver[0] < 2:
+        # 版本门(同 TransportUnavailable 语义:环境事实,重试无意义)。判官 transport
+        # 的全部形态(--standalone 私有 server、agent V2 定义、2.x 事件流)都是 2.x
+        # 语义;1.x 无对应物,分支=重写,故声明最低支持并如实报。
+        raise TransportUnavailable(
+            f"opencode 判官 transport 需 opencode ≥ 2.0(当前 {'.'.join(map(str, ver))});"
+            "1.x 无 --standalone/私有 server 与 agent V2 定义。可设 SIFT_LLM_TRANSPORT=cc/http/dsh 换判官引擎"
         )
     tmp = Path(tempfile.mkdtemp(prefix="sift-opencode-llm-"))
     try:
