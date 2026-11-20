@@ -1,7 +1,7 @@
 """opencode_llm 判官执行层:spawn 形态、隔离布局、事件流解析。全部 mock,不真跑 opencode。
 
 锁四条主线:① ``--standalone`` + 无工具 agent + prompt 走 stdin 的 spawn 形态
-(opencode 2.x spike 钉死的契约);② 单临时目录三合一(cwd = XDG_DATA_HOME =
+(opencode 2.x spike 写死的契约);② 单临时目录三合一(cwd = XDG_DATA_HOME =
 tmp,内含 opencode.json agent 定义 + seed 的 auth.json);③ 事件流解析(text 按
 part id 取末态/多 part 直拼、step_finish tokens/cost、error 事件、零文本);
 ④ model 语义(含 / 才传 -m)与 CLI 缺失的 loud 失败。

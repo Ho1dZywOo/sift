@@ -75,9 +75,9 @@ def test_llm_http_call_other_code_still_runtime_error(monkeypatch):
 
 
 def _pin_which(monkeypatch, present):
-    """钉死 which 探测(桥接层测试环境无关):present 里的名字视为已装,其余缺位。
+    """写死 which 探测(桥接层测试环境无关):present 里的名字视为已装,其余缺位。
 
-    http→cc 回退支线现在查兜底表(缺 claude 时转 opencode),不钉的话测试结果随
+    http→cc 回退支线现在查兜底表(缺 claude 时转 opencode),不写死的话测试结果随
     本机装了什么 CLI 而抖。
     """
     monkeypatch.setattr(utils.shutil, "which", lambda name: f"/fake/{name}" if name in present else None)

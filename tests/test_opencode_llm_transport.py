@@ -34,7 +34,7 @@ def test_resolve_llm_transport_supports_opencode(monkeypatch):
 def test_resolve_llm_transport_default_param_and_env_precedence(monkeypatch):
     """site default 经 default 参数表达;env 覆盖 site default;显式值覆盖 env。"""
     monkeypatch.delenv("SIFT_LLM_TRANSPORT", raising=False)
-    # 钉死 which(cc 是兜底源,resolve 会探测 claude 在不在;不钉则结果随本机装的 CLI 抖)
+    # 写死 which(cc 是兜底源,resolve 会探测 claude 在不在;不写死则结果随本机装的 CLI 抖)
     monkeypatch.setattr(transport.shutil, "which", lambda name: f"/fake/{name}" if name == "claude" else None)
     assert transport.resolve_llm_transport(None, default="http") == "http"
     monkeypatch.setenv("SIFT_LLM_TRANSPORT", "opencode")
@@ -147,7 +147,7 @@ def test_call_dsh_items_array_unwrap_parity(monkeypatch):
 
 
 def _pin_which(monkeypatch, present: set[str]):
-    """钉死 which 探测:present 里的 CLI 视为已装,其余缺位(测试不随本机装的 CLI 抖)。"""
+    """写死 which 探测:present 里的 CLI 视为已装,其余缺位(测试不随本机装的 CLI 抖)。"""
     monkeypatch.setattr(transport.shutil, "which", lambda name: f"/fake/{name}" if name in present else None)
 
 
