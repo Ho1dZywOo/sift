@@ -18,7 +18,7 @@ import pytest
 import sift.evals.opencode_db as ocdb
 from sift.errors import ExecutionError, OpencodeDbError
 
-# 版本探测默认钉死 2.0.24(经进程内缓存注入,不打真 CLI):list/export 的 1.x/2.x
+# 版本探测默认写死 2.0.24(经进程内缓存注入,不打真 CLI):list/export 的 1.x/2.x
 # 分支测试各自覆写缓存;1.x/2.x 分叉是本模块的被测行为,不能依赖本机装的是哪代。
 @pytest.fixture(autouse=True)
 def _pin_version_cache(monkeypatch):

@@ -169,7 +169,7 @@ def patched_spawn(monkeypatch):
     monkeypatch.setattr(mod, "spawn_cli", fake_spawn_cli)
     monkeypatch.setattr(mod, "seed_auth", fake_seed_auth)
     monkeypatch.setattr(mod.tempfile, "mkdtemp", tracking_mkdtemp)
-    # 版本门钉死(默认 2.0.24;单测可置 cap["version"] 覆写)——真探测在 CI 无
+    # 版本门写死(默认 2.0.24;单测可置 cap["version"] 覆写)——真探测在 CI 无
     # opencode 的环境会炸,且测试要的就是不依赖本机版本。
     monkeypatch.setattr(mod, "opencode_version", lambda: cap.get("version", (2, 0, 24)))
     return cap

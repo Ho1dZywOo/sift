@@ -91,7 +91,7 @@ def patched_spawn(monkeypatch, tmp_path):
     monkeypatch.setattr(ocr.shutil, "which", fake_which)
     monkeypatch.setattr(ocr, "run_opencode", fake_run_opencode)
     monkeypatch.setattr(ocr, "isolated_xdg_env_seeded", lambda: _yield_ctx(tmp_path))
-    # 版本探测钉死(默认 2.0.24;单测置 cap["version"] 切 1.x 分支)——1.x/2.x 命令面
+    # 版本探测写死(默认 2.0.24;单测置 cap["version"] 切 1.x 分支)——1.x/2.x 命令面
     # 分叉按版本判定,测试不能依赖本机装的是哪代。
     monkeypatch.setattr(ocr, "opencode_version", lambda: cap["version"])
     return cap
